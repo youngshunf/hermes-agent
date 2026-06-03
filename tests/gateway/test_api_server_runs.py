@@ -443,6 +443,31 @@ class TestRunEvents:
         )
 
     @pytest.mark.asyncio
+    async def test_empty_agent_response_is_failed_run(self, adapter):
+        """Hermes must not report its sentinel '(empty)' as a successful run."""
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "(empty)"}
+                mock_agent.session_prompt_tokens = 10
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 10
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                assert resp.status == 202
+                data = await resp.json()
+                run_id = data["run_id"]
+
+                events_resp = await cli.get(f"/v1/runs/{run_id}/events")
+                assert events_resp.status == 200
+                body = await events_resp.text()
+
+                assert "run.failed" in body
+                assert "empty response" in body
+
+    @pytest.mark.asyncio
     async def test_events_not_found_returns_404(self, adapter):
         app = _create_runs_app(adapter)
         async with TestClient(TestServer(app)) as cli:

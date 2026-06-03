@@ -493,6 +493,11 @@ def _openai_error(message: str, err_type: str = "invalid_request_error", param: 
     }
 
 
+def _is_empty_agent_response(value: Any) -> bool:
+    """Return True for Hermes's terminal no-visible-output sentinel."""
+    return str(value or "").strip().lower() == "(empty)" or not str(value or "").strip()
+
+
 if AIOHTTP_AVAILABLE:
     @web.middleware
     async def body_limit_middleware(request, handler):
@@ -3083,20 +3088,36 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                 else:
                     final_response = result.get("final_response", "") if isinstance(result, dict) else ""
-                    q.put_nowait({
-                        "event": "run.completed",
-                        "run_id": run_id,
-                        "timestamp": time.time(),
-                        "output": final_response,
-                        "usage": usage,
-                    })
-                    self._set_run_status(
-                        run_id,
-                        "completed",
-                        output=final_response,
-                        usage=usage,
-                        last_event="run.completed",
-                    )
+                    if _is_empty_agent_response(final_response):
+                        error_msg = "agent run completed with empty response"
+                        q.put_nowait({
+                            "event": "run.failed",
+                            "run_id": run_id,
+                            "timestamp": time.time(),
+                            "error": error_msg,
+                        })
+                        self._set_run_status(
+                            run_id,
+                            "failed",
+                            error=error_msg,
+                            usage=usage,
+                            last_event="run.failed",
+                        )
+                    else:
+                        q.put_nowait({
+                            "event": "run.completed",
+                            "run_id": run_id,
+                            "timestamp": time.time(),
+                            "output": final_response,
+                            "usage": usage,
+                        })
+                        self._set_run_status(
+                            run_id,
+                            "completed",
+                            output=final_response,
+                            usage=usage,
+                            last_event="run.completed",
+                        )
             except asyncio.CancelledError:
                 self._set_run_status(
                     run_id,
