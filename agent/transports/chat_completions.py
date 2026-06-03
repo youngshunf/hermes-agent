@@ -551,6 +551,22 @@ class ChatCompletionsTransport(ProviderTransport):
         unified format) and reasoning_content (DeepSeek/Moonshot) are also
         preserved for downstream replay.
         """
+        # Defensive guard（零-fake）：某些 LLM 网关（如 new-api）在异常时会返回一个
+        # 裸字符串（错误体 / 非 JSON）或空 choices，而不是合法的 ChatCompletion 对象。
+        # 若不拦截，下面的 ``response.choices[0]`` 会抛出晦涩的
+        # ``'str' object has no attribute 'choices'``（曾在 max-iterations 总结路径
+        # 触发，被外层 catch 包成 "couldn't summarize" 错误，根因被 AttributeError
+        # 掩盖）。这里把网关返回的真实 payload 暴露出来，便于定位是网关/配置问题，
+        # 与 bedrock transport 的现有 ``hasattr(response, "choices")`` 守卫保持一致。
+        if not hasattr(response, "choices") or not response.choices:
+            snippet = repr(response)
+            if len(snippet) > 500:
+                snippet = snippet[:500] + "…"
+            raise ValueError(
+                "LLM gateway returned a non-ChatCompletion response "
+                f"({type(response).__name__}); expected an object with non-empty "
+                f"`.choices`. Raw payload: {snippet}"
+            )
         choice = response.choices[0]
         msg = choice.message
         finish_reason = choice.finish_reason or "stop"

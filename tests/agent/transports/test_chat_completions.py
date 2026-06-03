@@ -712,6 +712,19 @@ class TestChatCompletionsNormalize:
         assert nr.finish_reason == "stop"
         assert nr.tool_calls is None
 
+    def test_normalize_rejects_str_response(self, transport):
+        """new-api 等网关异常时返回裸字符串（错误体），normalize_response 必须抛出
+        暴露真实 payload 的清晰错误，而不是晦涩的 'str' object has no attribute 'choices'。"""
+        with pytest.raises(ValueError, match="non-ChatCompletion response"):
+            transport.normalize_response("upstream gateway error: rate limited")
+
+    def test_normalize_rejects_empty_or_none_choices(self, transport):
+        """choices 为空/None 时同样抛清晰错误，而非 IndexError/AttributeError。"""
+        with pytest.raises(ValueError, match="non-ChatCompletion response"):
+            transport.normalize_response(SimpleNamespace(choices=[]))
+        with pytest.raises(ValueError, match="non-ChatCompletion response"):
+            transport.normalize_response(SimpleNamespace(choices=None))
+
     def test_tool_call_response(self, transport):
         tc = SimpleNamespace(
             id="call_123",
