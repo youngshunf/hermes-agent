@@ -2939,6 +2939,19 @@ class APIServerAdapter(BasePlatformAdapter):
 
         run_id = f"run_{uuid.uuid4().hex}"
         session_id = body.get("session_id") or stored_session_id or run_id
+        # 策略 A（会话连续性）：调用方（hasn-node daemon）只送稳定 session_id，由本
+        # 服务按 session_id 自管历史。当 body 未显式带 conversation_history 且 session_id
+        # 来自调用方（body.session_id，而非本次 run_id 兜底）时，从 state.db 回载该
+        # session 的历史，实现跨消息续接 —— 否则上游每条消息都冷启动新 session。
+        # 与 _handle_chat_completions 同一机制；_handle_runs 已过 _check_auth，等同
+        # 认证后续接，不存在未授权枚举 session 历史的风险。
+        if not conversation_history and body.get("session_id"):
+            try:
+                db = self._ensure_session_db()
+                if db is not None:
+                    conversation_history = db.get_messages_as_conversation(session_id)
+            except Exception as e:
+                logger.warning("runs: failed to load session history for %s: %s", session_id, e)
         approval_session_key = gateway_session_key or session_id or run_id
         ephemeral_system_prompt = instructions
         loop = asyncio.get_running_loop()

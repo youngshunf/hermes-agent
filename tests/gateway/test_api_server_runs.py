@@ -258,6 +258,91 @@ class TestRunStatus:
                 assert status["session_id"] == "space-session"
 
     @pytest.mark.asyncio
+    async def test_runs_reloads_history_from_db_for_explicit_session(self, adapter):
+        """策略 A：给定 body.session_id 且无 conversation_history 时，从 state.db
+        按 session_id 回载历史喂给 run_conversation，实现跨消息会话续接。"""
+        app = _create_runs_app(adapter)
+        prior_history = [
+            {"role": "user", "content": "我叫小智"},
+            {"role": "assistant", "content": "你好小智"},
+        ]
+        mock_db = MagicMock()
+        mock_db.get_messages_as_conversation.return_value = prior_history
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create, patch.object(
+                adapter, "_ensure_session_db", return_value=mock_db
+            ):
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "记得"}
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={"input": "我叫什么", "session_id": "sess_continuity"},
+                )
+                data = await resp.json()
+                run_id = data["run_id"]
+                for _ in range(20):
+                    status_resp = await cli.get(f"/v1/runs/{run_id}")
+                    status = await status_resp.json()
+                    if status["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+
+                mock_db.get_messages_as_conversation.assert_called_once_with("sess_continuity")
+                mock_agent.run_conversation.assert_called_once()
+                assert (
+                    mock_agent.run_conversation.call_args.kwargs["conversation_history"]
+                    == prior_history
+                )
+
+    @pytest.mark.asyncio
+    async def test_runs_skips_db_reload_when_body_history_present(self, adapter):
+        """body 已带 conversation_history 时不从 db 覆盖（优先调用方显式历史）。"""
+        app = _create_runs_app(adapter)
+        explicit = [{"role": "user", "content": "显式历史"}]
+        mock_db = MagicMock()
+        mock_db.get_messages_as_conversation.return_value = [
+            {"role": "user", "content": "DB历史"}
+        ]
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create, patch.object(
+                adapter, "_ensure_session_db", return_value=mock_db
+            ):
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "ok"}
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={
+                        "input": "hi",
+                        "session_id": "sess_x",
+                        "conversation_history": explicit,
+                    },
+                )
+                data = await resp.json()
+                run_id = data["run_id"]
+                for _ in range(20):
+                    status_resp = await cli.get(f"/v1/runs/{run_id}")
+                    status = await status_resp.json()
+                    if status["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+
+                mock_db.get_messages_as_conversation.assert_not_called()
+                assert (
+                    mock_agent.run_conversation.call_args.kwargs["conversation_history"]
+                    == explicit
+                )
+
+    @pytest.mark.asyncio
     async def test_status_not_found_returns_404(self, adapter):
         app = _create_runs_app(adapter)
         async with TestClient(TestServer(app)) as cli:
