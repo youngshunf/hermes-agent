@@ -1239,6 +1239,82 @@ class APIServerAdapter(BasePlatformAdapter):
         })
 
     # ------------------------------------------------------------------
+    # /v1/mcp — MCP connection status + manual reconnect (HuanXing)
+    # ------------------------------------------------------------------
+
+    async def _handle_mcp_status(self, request: "web.Request") -> "web.Response":
+        """GET /v1/mcp/status — per-MCP-server connection status (HuanXing).
+
+        Reports each configured MCP server's transport, connected state, tool
+        count, whether its background task is still retrying after a drop, the
+        circuit-breaker state, and the last connection error. Powers the agent
+        detail page's "MCP 连接状态" card (daemon proxies this).
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            from tools.mcp_tool import get_mcp_status
+            # get_mcp_status() reads the config file + inspects live tasks; run
+            # it off the event loop so a slow disk read can't stall the gateway.
+            loop = asyncio.get_event_loop()
+            servers = await loop.run_in_executor(None, get_mcp_status)
+        except Exception:
+            logger.exception("GET /v1/mcp/status failed")
+            return web.json_response(
+                _openai_error("Failed to read MCP status", err_type="server_error"),
+                status=500,
+            )
+        return web.json_response({
+            "object": "list",
+            "platform": "api_server",
+            "servers": servers,
+        })
+
+    async def _handle_mcp_reconnect(self, request: "web.Request") -> "web.Response":
+        """POST /v1/mcp/reconnect — force a fresh reconnect of MCP server(s).
+
+        Optional body ``{"server": "<name>"}`` targets one server; absent ⇒ all.
+        Tears the server(s) down and rebuilds them from the current on-disk
+        config (so a rotated MCP key is picked up), resets the circuit breaker,
+        and returns the post-reconnect status. Powers the "重新连接" button.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        server_name: Optional[str] = None
+        try:
+            if request.can_read_body:
+                body = await request.json()
+                if isinstance(body, dict):
+                    raw = body.get("server")
+                    if isinstance(raw, str) and raw.strip():
+                        server_name = raw.strip()
+        except Exception:
+            server_name = None
+        try:
+            from tools.mcp_tool import reconnect_mcp_servers
+            # reconnect_mcp_servers() blocks (tears down + re-discovers on the
+            # MCP loop, polling from the caller thread); offload to an executor
+            # so it never blocks the aiohttp event loop.
+            loop = asyncio.get_event_loop()
+            servers = await loop.run_in_executor(
+                None, reconnect_mcp_servers, server_name
+            )
+        except Exception:
+            logger.exception("POST /v1/mcp/reconnect failed")
+            return web.json_response(
+                _openai_error("Failed to reconnect MCP server", err_type="server_error"),
+                status=500,
+            )
+        return web.json_response({
+            "object": "list",
+            "platform": "api_server",
+            "reconnected": server_name or "all",
+            "servers": servers,
+        })
+
+    # ------------------------------------------------------------------
     # /api/sessions — thin client/session resource API
     # ------------------------------------------------------------------
 
@@ -4159,6 +4235,9 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
             self._app.router.add_post("/v1/runs/{run_id}/approval", self._handle_run_approval)
             self._app.router.add_post("/v1/runs/{run_id}/stop", self._handle_stop_run)
+            # HuanXing: MCP connection status + manual reconnect (agent detail UI)
+            self._app.router.add_get("/v1/mcp/status", self._handle_mcp_status)
+            self._app.router.add_post("/v1/mcp/reconnect", self._handle_mcp_reconnect)
             # Store the adapter after native routes are registered. Local Hermes-Relay
             # bootstrap shims use this key as a feature-detection hook; registering
             # native routes first lets those shims no-op instead of shadowing the

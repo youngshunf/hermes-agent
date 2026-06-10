@@ -1352,6 +1352,38 @@ class MCPServerTask:
         self._reconnect_event.clear()
         return "reconnect"
 
+    async def _sleep_or_wake(self, seconds: float) -> bool:
+        """Sleep up to ``seconds``, returning early if a reconnect or shutdown
+        is signalled.
+
+        HuanXing addition: makes the reconnect-backoff sleep interruptible.
+        Returns ``True`` when woken by ``_reconnect_event`` (a manual
+        ``/v1/mcp/reconnect`` or daemon-driven recovery), so the caller can
+        reset its backoff and retry immediately instead of waiting out the
+        full window. Honoring ``_shutdown_event`` keeps teardown prompt instead
+        of blocking for the whole capped backoff.
+        """
+        wake = asyncio.create_task(self._reconnect_event.wait())
+        stop = asyncio.create_task(self._shutdown_event.wait())
+        try:
+            await asyncio.wait(
+                {wake, stop},
+                timeout=seconds,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            for t in (wake, stop):
+                if not t.done():
+                    t.cancel()
+                    try:
+                        await t
+                    except (asyncio.CancelledError, Exception):
+                        pass
+        if self._reconnect_event.is_set():
+            self._reconnect_event.clear()
+            return True
+        return False
+
     async def _run_stdio(self, config: dict):
         """Run the server using stdio transport."""
         if not _MCP_AVAILABLE:
@@ -1752,6 +1784,9 @@ class MCPServerTask:
             if hasattr(tools_result, "tools")
             else []
         )
+        # Healthy enough to list tools → clear any recorded connection error so
+        # get_mcp_status() stops surfacing a stale reason once reconnected.
+        _record_server_error(self.name, None)
 
     async def run(self, config: dict):
         """Long-lived coroutine: connect, discover tools, wait, disconnect.
@@ -1875,11 +1910,16 @@ class MCPServerTask:
                         return
 
                     initial_retries += 1
+                    # HuanXing: unwrap the anyio TaskGroup/ExceptionGroup so the
+                    # log shows the real cause (connection refused / 401 / ...)
+                    # instead of the opaque "unhandled errors in a TaskGroup".
+                    detail = _format_connect_error(exc)
+                    _record_server_error(self.name, detail)
                     if initial_retries > _MAX_INITIAL_CONNECT_RETRIES:
                         logger.warning(
                             "MCP server '%s' failed initial connection after "
                             "%d attempts, giving up: %s",
-                            self.name, _MAX_INITIAL_CONNECT_RETRIES, exc,
+                            self.name, _MAX_INITIAL_CONNECT_RETRIES, detail,
                         )
                         self._error = exc
                         self._ready.set()
@@ -1889,10 +1929,10 @@ class MCPServerTask:
                         "MCP server '%s' initial connection failed "
                         "(attempt %d/%d), retrying in %.0fs: %s",
                         self.name, initial_retries,
-                        _MAX_INITIAL_CONNECT_RETRIES, backoff, exc,
+                        _MAX_INITIAL_CONNECT_RETRIES, backoff, detail,
                     )
-                    await asyncio.sleep(backoff)
-                    backoff = min(backoff * 2, _MAX_BACKOFF_SECONDS)
+                    woken = await self._sleep_or_wake(backoff)
+                    backoff = 1.0 if woken else min(backoff * 2, _MAX_BACKOFF_SECONDS)
 
                     # Check if shutdown was requested during the sleep
                     if self._shutdown_event.is_set():
@@ -1910,22 +1950,35 @@ class MCPServerTask:
                     return
 
                 retries += 1
+                detail = _format_connect_error(exc)
+                _record_server_error(self.name, detail)
                 if retries > _MAX_RECONNECT_RETRIES:
+                    # HuanXing patch: do NOT permanently give up on a transient
+                    # drop. The old code returned here, leaving the server dead
+                    # (every later tool call → "MCP server '...' is not
+                    # connected") until the whole runtime restarted — a brief
+                    # backend bounce could disable an agent's tools for hours.
+                    # Instead keep probing at the capped backoff so the server
+                    # self-heals when the endpoint returns; a manual
+                    # /v1/mcp/reconnect wakes the sleep immediately.
+                    if retries == _MAX_RECONNECT_RETRIES + 1:
+                        logger.warning(
+                            "MCP server '%s' still unreachable after %d attempts; "
+                            "switching to persistent background retry every %.0fs: %s",
+                            self.name, _MAX_RECONNECT_RETRIES,
+                            _MAX_BACKOFF_SECONDS, detail,
+                        )
+                else:
                     logger.warning(
-                        "MCP server '%s' failed after %d reconnection attempts, "
-                        "giving up: %s",
-                        self.name, _MAX_RECONNECT_RETRIES, exc,
+                        "MCP server '%s' connection lost (attempt %d/%d), "
+                        "reconnecting in %.0fs: %s",
+                        self.name, retries, _MAX_RECONNECT_RETRIES,
+                        backoff, detail,
                     )
-                    return
-
-                logger.warning(
-                    "MCP server '%s' connection lost (attempt %d/%d), "
-                    "reconnecting in %.0fs: %s",
-                    self.name, retries, _MAX_RECONNECT_RETRIES,
-                    backoff, exc,
-                )
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, _MAX_BACKOFF_SECONDS)
+                woken = await self._sleep_or_wake(backoff)
+                backoff = 1.0 if woken else min(backoff * 2, _MAX_BACKOFF_SECONDS)
+                if woken:
+                    retries = 0
 
                 # Check again after sleeping
                 if self._shutdown_event.is_set():
@@ -2027,6 +2080,22 @@ def _reset_server_error(server_name: str) -> None:
     """
     _server_error_counts[server_name] = 0
     _server_breaker_opened_at.pop(server_name, None)
+
+
+# HuanXing: last human-readable connection error per server, so
+# get_mcp_status() / the agent-detail UI can show *why* a server is
+# disconnected (e.g. "401 Unauthorized", "All connection attempts failed").
+# Survives task death (module-level), unlike MCPServerTask._error.
+_server_last_error: Dict[str, str] = {}
+
+
+def _record_server_error(server_name: str, text: Optional[str]) -> None:
+    """Record (``text``) or clear (``text is None``/empty) a server's last
+    connection error for status reporting."""
+    if text:
+        _server_last_error[server_name] = text
+    else:
+        _server_last_error.pop(server_name, None)
 
 # ---------------------------------------------------------------------------
 # Auth-failure detection helpers (Task 6 of MCP OAuth consolidation)
@@ -3667,25 +3736,110 @@ def get_mcp_status() -> List[dict]:
     for name, cfg in configured.items():
         transport = cfg.get("transport", "http") if "url" in cfg else "stdio"
         server = active_servers.get(name)
+        breaker_open = (
+            _server_error_counts.get(name, 0) >= _CIRCUIT_BREAKER_THRESHOLD
+        )
         if server and server.session is not None:
             entry = {
                 "name": name,
                 "transport": transport,
                 "tools": len(server._registered_tool_names) if hasattr(server, "_registered_tool_names") else len(server._tools),
                 "connected": True,
+                # HuanXing status fields (additive; banner display ignores them):
+                "retrying": False,
+                "circuit_open": False,
+                "error": None,
             }
             if server._sampling:
                 entry["sampling"] = dict(server._sampling.metrics)
             result.append(entry)
         else:
+            # Disconnected: the task may still be alive and retrying (after a
+            # drop, the HuanXing persistent-retry loop keeps it running) or it
+            # never connected / permanently failed initial connect (absent from
+            # _servers). ``retrying`` distinguishes "will self-heal" from "dead".
+            task_alive = bool(
+                server and server._task is not None and not server._task.done()
+            )
             result.append({
                 "name": name,
                 "transport": transport,
                 "tools": 0,
                 "connected": False,
+                "retrying": task_alive,
+                "circuit_open": breaker_open,
+                "error": _server_last_error.get(name),
             })
 
     return result
+
+
+def reconnect_mcp_servers(name: Optional[str] = None) -> List[dict]:
+    """Force a fresh reconnect of one or all configured MCP servers.
+
+    HuanXing addition — the manual ("重新连接" button) and daemon-driven
+    recovery path. Unlike the task's automatic reconnect (which reuses the
+    in-memory config), this tears the target server(s) down and rebuilds them
+    from the *current* on-disk config, so a credential rotation written to
+    config.yaml/.env just before this call is picked up (fixes a stale-key
+    401 once the daemon re-provisions). Works even for a server whose
+    background task has permanently exited, and resets its circuit breaker.
+
+    Args:
+        name: A specific configured server name, or ``None`` for every enabled
+            server.
+
+    Returns:
+        The post-reconnect status list (same shape as :func:`get_mcp_status`).
+    """
+    if not _MCP_AVAILABLE:
+        return get_mcp_status()
+
+    configured = _load_mcp_config()
+    if not configured:
+        return get_mcp_status()
+
+    if name is not None:
+        targets = [name] if name in configured else []
+    else:
+        targets = [
+            n for n, cfg in configured.items()
+            if _parse_boolish(cfg.get("enabled", True), default=True)
+        ]
+    if not targets:
+        return get_mcp_status()
+
+    _ensure_mcp_loop()
+
+    # 1. Detach + tear down any live tasks for the targets so
+    #    register_mcp_servers (which skips names already in _servers)
+    #    re-creates them from fresh config. shutdown() also deregisters the
+    #    server's stale tools, so re-discovery re-registers cleanly.
+    with _lock:
+        existing = [(t, _servers.pop(t)) for t in targets if t in _servers]
+    if existing:
+        async def _shutdown_targets():
+            await asyncio.gather(
+                *(srv.shutdown() for _, srv in existing),
+                return_exceptions=True,
+            )
+        try:
+            _run_on_mcp_loop(_shutdown_targets, timeout=30)
+        except Exception as exc:
+            logger.debug("reconnect: shutdown of %s failed: %s", targets, exc)
+
+    # 2. Reset the circuit breaker + last-error for every target (incl. ones
+    #    with no live task — a permanently-failed initial connect).
+    for t in targets:
+        _reset_server_error(t)
+        _record_server_error(t, None)
+
+    # 3. Rebuild from fresh config (re-reads rotated credentials/headers).
+    fresh = {t: configured[t] for t in targets}
+    logger.info("MCP manual reconnect requested for: %s", ", ".join(targets))
+    register_mcp_servers(fresh)
+
+    return get_mcp_status()
 
 
 def probe_mcp_server_tools() -> Dict[str, List[tuple]]:
