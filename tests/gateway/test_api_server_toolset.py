@@ -25,12 +25,15 @@ class TestHermesApiServerToolset:
         expected = [
             "terminal", "process",
             "read_file", "write_file", "patch", "search_files",
-            "vision_analyze", "image_generate",
+            "vision_analyze",
             "execute_code", "delegate_task",
             "todo", "memory", "session_search", "cronjob",
         ]
         for tool in expected:
             assert tool in tools, f"Missing expected tool: {tool}"
+        # HuanXing removes the upstream FAL image_generate (no provider here);
+        # image generation is served by the hasn.image.generate MCP tool.
+        assert "image_generate" not in tools, "image_generate should not be exposed"
 
     def test_toolset_includes_browser_tools(self):
         tools = resolve_toolset("hermes-api-server")

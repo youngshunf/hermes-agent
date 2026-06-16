@@ -44,10 +44,12 @@ class TestModuleSurface:
             "web_extract",
             "browser_navigate",
             "vision_analyze",
-            "image_generate",
             "skill_view",
         ):
             assert required in EXPOSED_TOOLS, f"missing {required!r}"
+        # HuanXing removes the upstream FAL image_generate (no provider here);
+        # image generation is served by the hasn.image.generate MCP tool.
+        assert "image_generate" not in EXPOSED_TOOLS
 
     def test_agent_loop_tools_not_exposed(self):
         """delegate_task / memory / session_search / todo require the

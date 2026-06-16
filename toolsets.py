@@ -35,8 +35,10 @@ _HERMES_CORE_TOOLS = [
     "terminal", "process",
     # File manipulation
     "read_file", "write_file", "patch", "search_files",
-    # Vision + image generation
-    "vision_analyze", "image_generate",
+    # Vision (image generation handled by HuanXing's hasn.image.generate MCP
+    # tool — the upstream FAL `image_generate` is intentionally NOT exposed;
+    # HuanXing has no FAL provider so it would only fail instantly.)
+    "vision_analyze",
     # Skills
     "skills_list", "skill_view", "skill_manage",
     # Browser automation
@@ -372,8 +374,9 @@ TOOLSETS = {
             "terminal", "process",
             # File manipulation
             "read_file", "write_file", "patch", "search_files",
-            # Vision + image generation
-            "vision_analyze", "image_generate",
+            # Vision (image generation via HuanXing hasn.image.generate MCP tool;
+            # upstream FAL `image_generate` intentionally not exposed — no FAL provider)
+            "vision_analyze",
             # Skills
             "skills_list", "skill_view", "skill_manage",
             # Browser automation

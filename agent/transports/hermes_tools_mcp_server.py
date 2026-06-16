@@ -17,7 +17,6 @@ Scope (what we expose):
     _snapshot / _scroll / _back / _press /
     _get_images / _console / _vision
   - vision_analyze                       — image inspection by vision model
-  - image_generate                       — image generation
   - skill_view, skills_list              — Hermes' skill library
   - text_to_speech                       — TTS
   - kanban_* (complete/block/comment/    — kanban worker + orchestrator
@@ -79,7 +78,8 @@ EXPOSED_TOOLS: tuple[str, ...] = (
     "browser_console",
     "browser_vision",
     "vision_analyze",
-    "image_generate",
+    # image_generate intentionally not exposed — HuanXing uses its own
+    # hasn.image.generate MCP tool; the upstream FAL tool has no provider here.
     "skill_view",
     "skills_list",
     "text_to_speech",
