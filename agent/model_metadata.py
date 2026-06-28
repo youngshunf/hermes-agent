@@ -275,6 +275,11 @@ DEFAULT_CONTEXT_LENGTHS = {
     # via a custom provider. Values sourced from models.dev (2026-04).
     # Keys use substring matching (longest-first), so e.g. "grok-4.20"
     # matches "grok-4.20-0309-reasoning" / "-non-reasoning" / "-multi-agent-0309".
+    # OAuth-only slug; absent from GET /v1/models. xAI publishes a 200k
+    # usable context window for Composer 2.5 on Grok Build (SuperGrok /
+    # Premium+); /v1/responses additionally enforces a ~262144 input+output
+    # budget, but the usable context (what we track here) is 200k.
+    "grok-composer": 200000,    # grok-composer-2.5-fast (Grok Build CLI)
     "grok-build": 256000,       # grok-build-0.1
     "grok-code-fast": 256000,   # grok-code-fast-1
     "grok-2-vision": 8192,      # grok-2-vision, -1212, -latest
@@ -1640,6 +1645,34 @@ def get_model_context_length(
     # 0. Explicit config override — user knows best
     if config_context_length is not None and isinstance(config_context_length, int) and config_context_length > 0:
         return config_context_length
+
+    # 0a. MoA virtual provider — ``model`` is a preset name, not a real model,
+    # and ``base_url`` is the local virtual endpoint, so every probe below would
+    # miss and fall through to the 256K default. The aggregator is the acting
+    # model, so resolve the context window from the aggregator slot's real
+    # provider+model instead. References are advisory-only and never bound the
+    # acting context, so they're ignored here.
+    if (provider or "").strip().lower() == "moa":
+        try:
+            from hermes_cli.config import load_config
+            from hermes_cli.moa_config import resolve_moa_preset
+            from hermes_cli.runtime_provider import resolve_runtime_provider
+
+            preset = resolve_moa_preset(load_config().get("moa") or {}, model)
+            agg = preset.get("aggregator") or {}
+            agg_provider = str(agg.get("provider") or "").strip()
+            agg_model = str(agg.get("model") or "").strip()
+            if agg_model and agg_provider and agg_provider.lower() != "moa":
+                rt = resolve_runtime_provider(requested=agg_provider, target_model=agg_model)
+                return get_model_context_length(
+                    agg_model,
+                    base_url=rt.get("base_url", "") or "",
+                    api_key=rt.get("api_key", "") or "",
+                    provider=agg_provider,
+                )
+        except Exception:
+            logger.debug("MoA aggregator context-length resolution failed", exc_info=True)
+        # Fall through to the generic default if aggregator resolution failed.
 
     # 0b. custom_providers per-model override — check before any probe.
     # This closes the gap where /model switch and display paths used to fall
