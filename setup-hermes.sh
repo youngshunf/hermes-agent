@@ -267,6 +267,33 @@ else
 fi
 
 # ============================================================================
+# 唤星 (HuanXing) gateway 必需平台依赖 —— 补齐 curated [all] 不再附带的项
+# ----------------------------------------------------------------------------
+# 上游 2026-05-12 政策把 messaging/feishu/dingtalk/voice 等平台依赖移出 curated
+# [all] extra，改为首次使用时经 tools/lazy_deps.py 懒安装（防一个被隔离的 PyPI
+# 包拖垮整个 fresh install）。但 hasn-node daemon 的控制面 **硬依赖** gateway 的
+# api_server adapter（它要绑 18xxx 端口、daemon 才认为 runtime 就绪），而
+# api_server 需要 aiohttp，且其缺失走的是 **warn-and-disable**（run.py 的
+# check_api_server_requirements()→False→"API Server: aiohttp not installed"→
+# 适配器返回 None）而 **非懒安装** → 网关永不绑端口 → daemon configure_llm
+# dispatch 45s 超时 dispatch=unknown → 内置 Hermes 分身全离线。feishu 渠道同理需
+# lark-oapi。故为唤星部署显式补齐 gateway 必需平台 extra，保证每次 venv 重建
+# （含上方 .[all] 回退路径、及手动 `uv sync` 重建）都可用。matrix 因 python-olm
+# 需系统级 libolm/make 故意不纳入（按需懒安装）。
+# ============================================================================
+echo -e "${CYAN}→${NC} 安装唤星 gateway 必需平台依赖 (api_server→aiohttp / feishu / dingtalk / voice)..."
+_HX_GATEWAY_EXTRAS="messaging,feishu,dingtalk,voice"
+if is_termux; then
+    "$SETUP_PYTHON" -m pip install -e ".[$_HX_GATEWAY_EXTRAS]" \
+        && echo -e "${GREEN}✓${NC} 唤星 gateway 平台依赖已就绪" \
+        || echo -e "${YELLOW}⚠${NC} 唤星 gateway 平台依赖有失败项（api_server 需 aiohttp，请检查上方输出）"
+else
+    UV_PROJECT_ENVIRONMENT="$SCRIPT_DIR/venv" $UV_CMD pip install -e ".[$_HX_GATEWAY_EXTRAS]" \
+        && echo -e "${GREEN}✓${NC} 唤星 gateway 平台依赖已就绪" \
+        || echo -e "${YELLOW}⚠${NC} 唤星 gateway 平台依赖有失败项（api_server 需 aiohttp，请检查上方输出）"
+fi
+
+# ============================================================================
 # ============================================================================
 # Optional: ripgrep (for faster file search)
 # ============================================================================
