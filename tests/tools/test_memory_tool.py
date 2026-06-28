@@ -650,3 +650,101 @@ class TestLoadTimeSnapshotSanitization:
         # Block marker appears exactly once, not nested
         assert snapshot.count("[BLOCKED:") == 1
         assert "Clean fact" in snapshot
+
+
+# =========================================================================
+# 唤星 B 路统一：USER.md 写入 → 云端 contribute 观察者钩子
+# =========================================================================
+
+import pytest as _pytest  # noqa: E402
+
+from tools.memory_tool import set_owner_memory_observer  # noqa: E402
+
+
+@_pytest.fixture
+def user_store(tmp_path, monkeypatch):
+    monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+    s = MemoryStore(memory_char_limit=500, user_char_limit=300)
+    s.load_from_disk()
+    return s
+
+
+class TestOwnerMemoryObserver:
+    def test_user_add_triggers_contribution(self, user_store):
+        captured = []
+        set_owner_memory_observer(lambda content: captured.append(content))
+        try:
+            result = json.loads(
+                memory_tool(action="add", target="user", content="主人偏好简洁直接的沟通", store=user_store)
+            )
+            assert result["success"] is True
+            assert captured == ["主人偏好简洁直接的沟通"]
+        finally:
+            set_owner_memory_observer(None)
+
+    def test_user_replace_triggers_contribution_with_new_content(self, user_store):
+        user_store.add("user", "主人住在昆明")
+        captured = []
+        set_owner_memory_observer(lambda content: captured.append(content))
+        try:
+            result = json.loads(
+                memory_tool(action="replace", target="user", old_text="昆明", content="主人住在昆明五华区", store=user_store)
+            )
+            assert result["success"] is True
+            assert captured == ["主人住在昆明五华区"]
+        finally:
+            set_owner_memory_observer(None)
+
+    def test_memory_target_does_not_trigger_contribution(self, user_store):
+        captured = []
+        set_owner_memory_observer(lambda content: captured.append(content))
+        try:
+            result = json.loads(
+                memory_tool(action="add", target="memory", content="项目用 PostgreSQL", store=user_store)
+            )
+            assert result["success"] is True
+            assert captured == []  # MEMORY.md 是 agent 私有，不上传
+        finally:
+            set_owner_memory_observer(None)
+
+    def test_user_remove_does_not_trigger_contribution(self, user_store):
+        user_store.add("user", "主人喜欢登山")
+        captured = []
+        set_owner_memory_observer(lambda content: captured.append(content))
+        try:
+            result = json.loads(
+                memory_tool(action="remove", target="user", old_text="登山", store=user_store)
+            )
+            assert result["success"] is True
+            assert captured == []  # remove 不表达为「观察」，不上传
+        finally:
+            set_owner_memory_observer(None)
+
+    def test_failed_user_add_does_not_trigger_contribution(self, user_store):
+        # 先填满 USER.md（user_char_limit=300），再 add 超限 → 写入失败，不应上传
+        user_store.add("user", "x" * 290)
+        captured = []
+        set_owner_memory_observer(lambda content: captured.append(content))
+        try:
+            result = json.loads(
+                memory_tool(action="add", target="user", content="y" * 100, store=user_store)
+            )
+            assert result["success"] is False
+            assert captured == []  # 写入失败不上传
+        finally:
+            set_owner_memory_observer(None)
+
+    def test_observer_exception_does_not_break_write(self, user_store):
+        def _boom(content):
+            raise RuntimeError("simulated host endpoint down")
+
+        set_owner_memory_observer(_boom)
+        try:
+            # 观察者抛错被吞，本地写入仍成功返回
+            result = json.loads(
+                memory_tool(action="add", target="user", content="主人是后端工程师", store=user_store)
+            )
+            assert result["success"] is True
+            assert "主人是后端工程师" in result["entries"]
+        finally:
+            set_owner_memory_observer(None)

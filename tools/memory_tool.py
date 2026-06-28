@@ -28,10 +28,11 @@ import logging
 import os
 import tempfile
 import time
+import urllib.request
 from contextlib import contextmanager
 from pathlib import Path
 from hermes_constants import get_hermes_home
-from typing import Dict, Any, List, Optional
+from typing import Callable, Dict, Any, List, Optional
 
 from utils import atomic_replace
 
@@ -47,6 +48,64 @@ except ImportError:
         pass
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# 唤星 B 路统一：USER.md（owner 维度记忆）写入 → 云端 contribute 合并管线
+# =============================================================================
+# agent 用本工具写 target=user（USER.md）= owner 维度记忆（主人画像），应并入云端
+# owner_memory 合并管线（去重 / 消解冲突 / 回拉覆盖下发给主人所有分身），而不是只落本地、
+# 绕过云端、且在下次 profile re-pull 时被覆盖丢失。每次 USER.md 写入（add/replace）成功后，
+# best-effort 把这条写入内容作为「观察」上传 runtime host 的 memory/contribute 端点（host 在
+# 拉起 gateway 子进程时经 env 注入端点 URL / cloud_base / 本地 token）→ host 转云端 contribute
+# → LLM 合并 → 回拉刷新本地 USER.md。失败绝不影响已成功的本地写入（云端 sweeper 会兜底重试）。
+# MEMORY.md（target=memory）是 agent 私有演化记忆，不上传。
+_OWNER_MEMORY_OBSERVER: Optional[Callable[[str], None]] = None
+
+
+def set_owner_memory_observer(observer: Optional[Callable[[str], None]]) -> None:
+    """注入 USER.md 写入观察者（测试用；默认走 env 配置的 host 端点 best-effort POST）。"""
+    global _OWNER_MEMORY_OBSERVER
+    _OWNER_MEMORY_OBSERVER = observer
+
+
+def _notify_owner_memory_observation(content: str) -> None:
+    """USER.md 写入成功后回调观察者（best-effort，绝不抛出影响本地写入结果）。"""
+    if not content or not content.strip():
+        return
+    observer = _OWNER_MEMORY_OBSERVER or _default_owner_memory_observer
+    try:
+        observer(content.strip())
+    except Exception as exc:  # best-effort：上传失败不影响本地写入（云端 sweeper 兜底重试）
+        logger.warning("owner memory contribution notify failed: %s", exc)
+
+
+def _default_owner_memory_observer(content: str) -> None:
+    """默认观察者：把 USER.md 写入条目 POST 到 host 的 memory/contribute 端点（env 配置）。
+
+    host 在拉起 gateway 子进程时注入：
+      HUANXING_OWNER_MEMORY_CONTRIBUTE_URL    host 自身 memory/contribute 路由（本 profile）
+      HUANXING_CLOUD_BASE_URL                 云端 base（host 转云端 contribute 用，可选）
+      HUANXING_OWNER_MEMORY_CONTRIBUTE_TOKEN  host 本地鉴权 token（可选）
+    未配置（如纯 CLI 单机场景）则静默跳过——退回纯本地 USER.md 行为，不改变上游默认。
+    """
+    url = os.environ.get("HUANXING_OWNER_MEMORY_CONTRIBUTE_URL")
+    if not url:
+        return
+    body: Dict[str, Any] = {"content": content}
+    cloud_base = os.environ.get("HUANXING_CLOUD_BASE_URL")
+    if cloud_base:
+        body["cloud_base_url"] = cloud_base
+    data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/json"}, method="POST"
+    )
+    token = os.environ.get("HUANXING_OWNER_MEMORY_CONTRIBUTE_TOKEN")
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+    with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310 (host 本地/受控 URL)
+        resp.read()
+
 
 # Where memory files live — resolved dynamically so profile overrides
 # (HERMES_HOME env var changes) are always respected.  The old module-level
@@ -709,6 +768,17 @@ def memory_tool(
     else:
         return tool_error(f"Unknown action '{action}'. Use: add, replace, remove", success=False)
 
+    # 唤星 B 路统一：USER.md（owner 维度）写入成功 → 把这条写入上传云端 contribute 管线
+    # （best-effort，去重由云端合并处理，故不传整份文件、只传本条写入）。remove 不易表达为
+    # 「观察」，故只上传 add/replace。MEMORY.md（agent 私有）不上传。
+    if (
+        target == "user"
+        and action in ("add", "replace")
+        and isinstance(result, dict)
+        and result.get("success")
+    ):
+        _notify_owner_memory_observation(content)
+
     return json.dumps(result, ensure_ascii=False)
 
 
@@ -728,12 +798,17 @@ def apply_memory_pending(payload: Dict[str, Any], store: "MemoryStore") -> Dict[
     content = payload.get("content") or ""
     old_text = payload.get("old_text") or ""
     if action == "add":
-        return store.add(target, content)
-    if action == "replace":
-        return store.replace(target, old_text, content)
-    if action == "remove":
+        result = store.add(target, content)
+    elif action == "replace":
+        result = store.replace(target, old_text, content)
+    elif action == "remove":
         return store.remove(target, old_text)
-    return {"success": False, "error": f"Unknown staged action '{action}'."}
+    else:
+        return {"success": False, "error": f"Unknown staged action '{action}'."}
+    # 唤星 B 路统一：gated（审批后回放）路径同样把 USER.md 写入上传云端 contribute（best-effort）。
+    if target == "user" and isinstance(result, dict) and result.get("success"):
+        _notify_owner_memory_observation(content)
+    return result
 # OpenAI Function-Calling Schema
 # =============================================================================
 
