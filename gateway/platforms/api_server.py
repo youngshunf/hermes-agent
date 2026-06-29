@@ -4127,6 +4127,10 @@ class APIServerAdapter(BasePlatformAdapter):
                         pass
 
                 def _run_sync():
+                    from gateway.hasn_session import (
+                        reset_hasn_session_id,
+                        set_hasn_session_id,
+                    )
                     from gateway.session_context import clear_session_vars
                     from tools.approval import (
                         register_gateway_notify,
@@ -4138,6 +4142,12 @@ class APIServerAdapter(BasePlatformAdapter):
                     effective_task_id = session_id or run_id
                     approval_token = None
                     session_tokens = []
+                    # 唤星会话绑定（提问卡修复）：把 daemon 透传的 session_id 绑到本 run 的
+                    # 执行线程（任务局部，并发会话互不串扰），供本地 hasn MCP 工具系统侧注入
+                    # ``_hasn_session_id``——哪个 session 发就回哪个 session，分身不自填。
+                    # 仅当调用方真送了 session_id 才绑（run_id 兜底不是真实会话，绑了反而误导）。
+                    hasn_session_token = None
+                    daemon_session_id = body.get("session_id") or stored_session_id
                     try:
                         # Bind approval/session identity for this API run via
                         # contextvars so concurrent runs do not share process
@@ -4146,6 +4156,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         session_tokens = self._bind_api_server_session(
                             session_key=approval_session_key,
                         )
+                        if daemon_session_id:
+                            hasn_session_token = set_hasn_session_id(daemon_session_id)
                         register_gateway_notify(approval_session_key, _approval_notify)
                         r = agent.run_conversation(
                             user_message=user_message,
@@ -4156,6 +4168,11 @@ class APIServerAdapter(BasePlatformAdapter):
                         try:
                             unregister_gateway_notify(approval_session_key)
                         finally:
+                            if hasn_session_token is not None:
+                                try:
+                                    reset_hasn_session_id(hasn_session_token)
+                                except Exception:
+                                    pass
                             if approval_token is not None:
                                 try:
                                     reset_current_session_key(approval_token)

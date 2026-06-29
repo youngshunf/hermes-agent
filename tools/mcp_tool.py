@@ -101,6 +101,14 @@ from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
+# 唤星会话绑定（提问卡修复）：对本地 hasn MCP 调用注入系统侧 ``_hasn_session_id``，
+# 让「向主人提问」类工具回到发起这次派发的会话（哪个 session 发就回哪个 session）。
+# gateway 在某些进程（CLI/cron）可能不可导入 → 此处为 None，工具调用照常、不打标。
+try:
+    from gateway.hasn_session import stamp_session_arg as _stamp_hasn_session_arg
+except Exception:  # pragma: no cover - gateway 不可导入的进程（CLI/cron）
+    _stamp_hasn_session_arg = None
+
 # Upper bound for the OSV malware preflight during stdio MCP startup. The
 # check makes a blocking urllib HTTPS call whose own timeout can fail to
 # interrupt a stalled SSL handshake, which froze the asyncio event loop and
@@ -3386,6 +3394,16 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             return json.dumps({
                 "error": f"MCP server '{server_name}' is not connected"
             }, ensure_ascii=False)
+
+        # 唤星会话绑定（提问卡修复）：在把参数交给 session.call_tool 之前，对本地 hasn MCP
+        # 调用系统侧注入 ``_hasn_session_id``（取自本 run 在执行线程绑定的 ContextVar）。
+        # 必须在这里（_handler 跑在 agent 执行线程，ContextVar 可见）算好参数——_call 调度
+        # 到独立的 MCP 事件循环，不继承本线程 ContextVar（见下方 _pending_call_context 注释）。
+        if _stamp_hasn_session_arg is not None:
+            try:
+                args = _stamp_hasn_session_arg(server_name, args)
+            except Exception:  # pragma: no cover - 注入是 best-effort，绝不因此打断工具调用
+                logger.debug("hasn session stamp skipped for %s/%s", server_name, tool_name)
 
         async def _call():
             async with server._rpc_lock:
