@@ -107,12 +107,21 @@ SUPPORTED_POOL_STRATEGIES = {
 }
 
 # Cooldown before retrying an exhausted credential.
-# Transient 401 auth failures cool down briefly so single-key setups can recover.
-# 429 (rate-limited), 402 (billing/quota), and other failures cool down after 1 hour.
+# Only genuinely-throttling/billing failures hold the full 1-hour cooldown
+# (429 rate-limit, 402 billing/quota) — there, retrying sooner just fails the
+# same way. Auth/transient/server failures recover fast, and benching the (often
+# only) credential for an hour turns a brief upstream hiccup into a long outage,
+# so they cool down briefly:
+#   - 401 auth failures: 5 minutes (single-key setups can recover after re-auth).
+#   - 403 (gateway group/channel/ACL transient — e.g. new-api "分组已删除" during a
+#     redeploy/AutoMigrate window): 1 minute; clears as soon as the gateway settles.
+#   - 5xx / connection resets / unknown (None status): 5 minutes.
 # Provider-supplied reset_at timestamps override these defaults.
 EXHAUSTED_TTL_401_SECONDS = 5 * 60           # 5 minutes
-EXHAUSTED_TTL_429_SECONDS = 60 * 60          # 1 hour
-EXHAUSTED_TTL_DEFAULT_SECONDS = 60 * 60      # 1 hour
+EXHAUSTED_TTL_403_SECONDS = 60               # 1 minute
+EXHAUSTED_TTL_402_SECONDS = 60 * 60          # 1 hour (billing/quota)
+EXHAUSTED_TTL_429_SECONDS = 60 * 60          # 1 hour (rate-limit)
+EXHAUSTED_TTL_DEFAULT_SECONDS = 5 * 60       # 5 minutes (5xx / connection / unknown)
 
 # Pool key prefix for custom OpenAI-compatible endpoints.
 # Custom endpoints all share provider='custom' but are keyed by their
@@ -252,6 +261,10 @@ def _exhausted_ttl(error_code: Optional[int]) -> int:
     """Return cooldown seconds based on the HTTP status that caused exhaustion."""
     if error_code == 401:
         return EXHAUSTED_TTL_401_SECONDS
+    if error_code == 403:
+        return EXHAUSTED_TTL_403_SECONDS
+    if error_code == 402:
+        return EXHAUSTED_TTL_402_SECONDS
     if error_code == 429:
         return EXHAUSTED_TTL_429_SECONDS
     return EXHAUSTED_TTL_DEFAULT_SECONDS

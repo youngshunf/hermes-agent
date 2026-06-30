@@ -296,6 +296,140 @@ def test_exhausted_401_entry_resets_after_five_minutes(tmp_path, monkeypatch):
     assert entry.last_status == "ok"
 
 
+def test_exhausted_403_entry_resets_after_one_minute(tmp_path, monkeypatch):
+    """Gateway 403 (group/channel/ACL transient — e.g. new-api "分组已删除"
+    during a redeploy) must not bench the only credential for an hour; it
+    clears within a minute so the agent recovers as soon as the gateway settles."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openrouter": [
+                    {
+                        "id": "cred-1",
+                        "label": "primary",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "***",
+                        "base_url": "https://openrouter.ai/api/v1",
+                        "last_status": "exhausted",
+                        "last_status_at": time.time() - 70,
+                        "last_error_code": 403,
+                    }
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openrouter")
+    entry = pool.select()
+
+    assert entry is not None
+    assert entry.id == "cred-1"
+    assert entry.last_status == "ok"
+
+
+def test_exhausted_403_entry_still_cooling_within_one_minute(tmp_path, monkeypatch):
+    """Inside the 60s 403 cooldown the credential stays benched (no hammering)."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openrouter": [
+                    {
+                        "id": "cred-1",
+                        "label": "primary",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "***",
+                        "base_url": "https://openrouter.ai/api/v1",
+                        "last_status": "exhausted",
+                        "last_status_at": time.time() - 30,
+                        "last_error_code": 403,
+                    }
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openrouter")
+    assert pool.has_available() is False
+    assert pool.select() is None
+
+
+def test_exhausted_unknown_status_resets_after_five_minutes(tmp_path, monkeypatch):
+    """5xx / connection / unknown (None status) cool down for 5 min, not an hour —
+    a gateway restart shouldn't strand the only credential for an hour."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openrouter": [
+                    {
+                        "id": "cred-1",
+                        "label": "primary",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "***",
+                        "base_url": "https://openrouter.ai/api/v1",
+                        "last_status": "exhausted",
+                        "last_status_at": time.time() - 310,
+                        "last_error_code": None,
+                    }
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openrouter")
+    entry = pool.select()
+
+    assert entry is not None
+    assert entry.id == "cred-1"
+    assert entry.last_status == "ok"
+
+
+def test_exhausted_ttl_mapping():
+    """Only billing(402)/rate-limit(429) hold the 1h cooldown; auth/transient
+    failures recover fast so a single-key pool isn't stranded for an hour."""
+    from agent.credential_pool import (
+        EXHAUSTED_TTL_401_SECONDS,
+        EXHAUSTED_TTL_402_SECONDS,
+        EXHAUSTED_TTL_403_SECONDS,
+        EXHAUSTED_TTL_429_SECONDS,
+        EXHAUSTED_TTL_DEFAULT_SECONDS,
+        _exhausted_ttl,
+    )
+
+    assert _exhausted_ttl(401) == EXHAUSTED_TTL_401_SECONDS == 5 * 60
+    assert _exhausted_ttl(403) == EXHAUSTED_TTL_403_SECONDS == 60
+    assert _exhausted_ttl(402) == EXHAUSTED_TTL_402_SECONDS == 60 * 60
+    assert _exhausted_ttl(429) == EXHAUSTED_TTL_429_SECONDS == 60 * 60
+    assert _exhausted_ttl(500) == EXHAUSTED_TTL_DEFAULT_SECONDS == 5 * 60
+    assert _exhausted_ttl(None) == EXHAUSTED_TTL_DEFAULT_SECONDS
+    # 403 recovers far faster than the old 1h default; only 429/402 stay long.
+    assert (
+        EXHAUSTED_TTL_403_SECONDS
+        < EXHAUSTED_TTL_DEFAULT_SECONDS
+        < EXHAUSTED_TTL_429_SECONDS
+    )
+
+
 def test_explicit_reset_timestamp_overrides_default_429_ttl(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     # Prevent auto-seeding from Codex CLI tokens on the host
