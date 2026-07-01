@@ -678,7 +678,18 @@ class MemoryStore:
         pct = min(100, int((current / limit) * 100)) if limit > 0 else 0
 
         if target == "user":
-            header = f"USER PROFILE (who the user is) [{pct}% — {current:,}/{limit:,} chars]"
+            # 唤星 HASN 修正：本块是「你主人的长期资料」（你代表 TA 行动），并不是「当前正在跟你
+            # 说话的人」的身份。上游原文 USER PROFILE (who the user is) 是单用户框定——在 HASN 里
+            # 分身会与主人本人、外部好友、别的分身、群成员多方对话，这个标题会让分身把当前好友/群成员
+            # 误当成主人（好友被当主人的根因：分身照着这块把对面称呼成主人、并背出主人的姓名/所在地）。
+            # 故改为「主人资料 + 明确声明不代表当前对话方」，当前对话方以每轮对话来源/系统提示为准。
+            header = (
+                f"你主人的长期资料 · YOUR MASTER's profile（你代表 TA 行动）"
+                f"[{pct}% — {current:,}/{limit:,} chars]\n"
+                f"（注意：这是你主人的身份与背景，说明「你代表谁行动」；它并不代表当前正在跟你说话的人"
+                f"就是你的主人——当前对话方是谁，一律以本轮对话的来源/系统提示为准。除非本轮明确说明"
+                f"对话方就是主人本人，否则不要把下面这些主人的专属信息当成当前对话方的信息。）"
+            )
         else:
             header = f"MEMORY (your personal notes) [{pct}% — {current:,}/{limit:,} chars]"
 
