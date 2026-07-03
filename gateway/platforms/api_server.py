@@ -3957,12 +3957,21 @@ class APIServerAdapter(BasePlatformAdapter):
         def _callback(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
             ts = time.time()
             if event_type == "tool.started":
+                # `args` are the redaction-safe display arguments for the call
+                # (see agent/tool_executor.py). They ONLY ride the started event
+                # — tool.completed carries none — so the owner's "查看思考与工具过程"
+                # panel can show "what was called". Without this the consumer
+                # only ever gets `preview` (empty for many MCP tools), so the
+                # tool row renders with no parameters. Mirrors the
+                # chat_completions `_tool_progress` callback which already sends
+                # `args`.
                 _push({
                     "event": "tool.started",
                     "run_id": run_id,
                     "timestamp": ts,
                     "tool": tool_name,
                     "preview": preview,
+                    "args": args,
                 })
             elif event_type == "tool.completed":
                 _push({
