@@ -4024,6 +4024,20 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(_openai_error("No user message found in input"), status=400)
 
         instructions = body.get("instructions")
+        # HASN 对话派发契约（hasn-node HermesAgentRuntimeAdapter）：对话路径把
+        # daemon prompt_assembly 组装的会话稳定片段（IdentityPeer「当前对话对象
+        # ≠主人」、会话行为、对方画像/关系/信任标签）放在 body.system_prompt；
+        # 任务路径放 instructions（两者互斥）。此前 runs 路径只读 instructions，
+        # system_prompt 被静默丢弃 → 分身从不知道「现在在跟谁说话」，把好友当
+        # 主人称呼（2026-07-04 福仔实测「在呢，福仔」）。与 instructions 同样叠
+        # 进 ephemeral system prompt（API-call 时追加在冻结核心 prompt 之后，
+        # 不进持久化）；daemon 每次 run 重发最新 bundle，逐轮生效。
+        system_prompt = body.get("system_prompt")
+        if system_prompt is not None and not isinstance(system_prompt, str):
+            return web.json_response(
+                _openai_error("'system_prompt' must be a string when provided"),
+                status=400,
+            )
         previous_response_id = body.get("previous_response_id")
 
         # Accept explicit conversation_history from the request body.
@@ -4086,7 +4100,16 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.warning("runs: failed to load session history for %s: %s", session_id, e)
         approval_session_key = gateway_session_key or session_id or run_id
-        ephemeral_system_prompt = instructions
+        # 对话路径 system_prompt 在前（身份框定优先），任务路径 instructions 在后；
+        # 正常情况下两者互斥，只会出现其一。
+        _ephemeral_parts = [part for part in (system_prompt, instructions) if part]
+        ephemeral_system_prompt = "\n\n".join(_ephemeral_parts) if _ephemeral_parts else None
+        if system_prompt:
+            logger.info(
+                "runs: layering caller system_prompt (%d chars) onto session %s",
+                len(system_prompt),
+                session_id,
+            )
         loop = asyncio.get_running_loop()
         q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue()
         created_at = time.time()

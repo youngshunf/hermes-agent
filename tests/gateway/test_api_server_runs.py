@@ -164,6 +164,98 @@ class TestStartRun:
         assert adapter._run_statuses == {}
 
     @pytest.mark.asyncio
+    async def test_runs_layers_body_system_prompt_into_ephemeral(self, adapter):
+        """HASN 对话派发契约：body.system_prompt（daemon prompt_assembly 组装的
+        IdentityPeer 等会话稳定片段）必须到达 agent 的 ephemeral system prompt。
+        回归背景：此前 runs 路径只读 instructions，system_prompt 被静默丢弃，
+        分身从不知道当前对话方是谁、把好友当主人称呼。"""
+        app = _create_runs_app(adapter)
+        identity_block = "【当前对话对象 ★必读】你正在与「菌子」对话，对方是好友，绝不是你的主人本人。"
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create, patch.object(
+                adapter, "_ensure_session_db", return_value=None
+            ):
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "ok"}
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={
+                        "input": "在吗",
+                        "session_id": "conv_x__peer_h_friend",
+                        "system_prompt": identity_block,
+                    },
+                )
+                assert resp.status == 202
+                data = await resp.json()
+                run_id = data["run_id"]
+                for _ in range(20):
+                    status_resp = await cli.get(f"/v1/runs/{run_id}")
+                    status = await status_resp.json()
+                    if status["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+
+                mock_create.assert_called_once()
+                assert (
+                    mock_create.call_args.kwargs["ephemeral_system_prompt"]
+                    == identity_block
+                )
+
+    @pytest.mark.asyncio
+    async def test_runs_combines_system_prompt_before_instructions(self, adapter):
+        """system_prompt（对话身份框定）在前、instructions（任务级）在后拼接。"""
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create, patch.object(
+                adapter, "_ensure_session_db", return_value=None
+            ):
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "ok"}
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={
+                        "input": "hi",
+                        "system_prompt": "身份框定",
+                        "instructions": "任务指令",
+                    },
+                )
+                assert resp.status == 202
+                data = await resp.json()
+                run_id = data["run_id"]
+                for _ in range(20):
+                    status_resp = await cli.get(f"/v1/runs/{run_id}")
+                    status = await status_resp.json()
+                    if status["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+
+                assert (
+                    mock_create.call_args.kwargs["ephemeral_system_prompt"]
+                    == "身份框定\n\n任务指令"
+                )
+
+    @pytest.mark.asyncio
+    async def test_runs_rejects_non_string_system_prompt(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/runs",
+                json={"input": "hi", "system_prompt": 123},
+            )
+        assert resp.status == 400
+        assert adapter._run_streams == {}
+
+    @pytest.mark.asyncio
     async def test_start_requires_auth(self, auth_adapter):
         app = _create_runs_app(auth_adapter)
         async with TestClient(TestServer(app)) as cli:
