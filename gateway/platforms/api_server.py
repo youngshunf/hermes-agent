@@ -4015,6 +4015,10 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception:
             return web.json_response(_openai_error("Invalid JSON"), status=400)
 
+        # 契约事实（与 hasn-node adapter hermes.rs payload 构造处注释互认，事实源：
+        # 父仓 docs/hasn-node设计文档/04-Runtime接入/14-runs传输契约与消息投递可靠性）：
+        # 用户消息只读 `input`；body 里的 `message.{role,content}` 是 sidecar
+        # RunEnvelope 时代的镜像死字段，本路径不读——调用方改用户消息必须改 `input`。
         raw_input = body.get("input")
         if not raw_input:
             return web.json_response(_openai_error("Missing 'input' field"), status=400)
