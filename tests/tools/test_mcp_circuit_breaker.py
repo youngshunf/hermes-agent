@@ -370,6 +370,12 @@ def test_run_loop_parks_instead_of_exiting_then_revives(monkeypatch, tmp_path):
 
     # Shrink the budget and collapse backoff sleeps (but still yield control
     # to the loop) so the test runs fast without starving the scheduler.
+    #
+    # 注意：重连退避走的是 _sleep_or_wake→asyncio.wait(timeout=)（HuanXing 可
+    # 中断退避），**不是** asyncio.sleep，所以单纯 patch asyncio.sleep 压不到退避，
+    # 循环会真的等 1s+2s 墙钟才停泊，而下面的探测只做 500 次瞬时 sleep(0) 让步、
+    # 微秒内耗尽 → deregister 尚未发生就断言失败。真正要压平的是 _sleep_or_wake，
+    # 见 _Task 里的覆写。asyncio.sleep 的 patch 保留以兜住路径上其它零散 sleep。
     monkeypatch.setattr(mcp_tool, "_MAX_RECONNECT_RETRIES", 2)
 
     _real_sleep = asyncio.sleep
@@ -408,6 +414,18 @@ def test_run_loop_parks_instead_of_exiting_then_revives(monkeypatch, tmp_path):
                     await self._wait_for_lifecycle_event()
                     return
                 raise RuntimeError("still down")
+
+            async def _sleep_or_wake(self, seconds):
+                # 把可中断退避压平为一次让步（不真的等 1s/2s/4s）：真实退避走
+                # _sleep_or_wake→asyncio.wait(timeout=)，而非 asyncio.sleep，故上面
+                # 对 asyncio.sleep 的 patch 压不到它。覆写让循环快速走到「预算耗尽
+                # →停泊」，同时保留唤醒语义（reconnect 置位即返回 True 并清事件）
+                # 与让步（await 一次真实 sleep(0)）；shutdown 由调用方在返回后自查。
+                await _real_sleep(0)
+                if self._reconnect_event.is_set():
+                    self._reconnect_event.clear()
+                    return True
+                return False
 
         task = _Task("srv")
         task._registered_tool_names = ["srv__tool"]
