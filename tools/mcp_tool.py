@@ -329,6 +329,11 @@ _DEFAULT_CONNECT_TIMEOUT = 60    # seconds for initial connection per server
 _MAX_RECONNECT_RETRIES = 5
 _MAX_INITIAL_CONNECT_RETRIES = 3 # retries for the very first connection attempt
 _MAX_BACKOFF_SECONDS = 60
+# HuanXing: 停泊后的自探周期（秒）。重连预算耗尽后不再无限期干等外部信号，而是每
+# 隔这么久自己探一次——让「断网/云端不可达超过重试预算 → 停泊」的服务器在网络恢复后
+# 无需任何外部触发即自愈。天然限流（每 server ~60s 一次、非破坏、只重建 transport
+# 不重铸凭据），不会引发重连风暴。
+_PARKED_REPROBE_SECONDS = 60
 
 # Keepalive cadence for HTTP/SSE sessions. The MCP spec lets a server expire
 # idle sessions on any TTL it chooses (Streamable HTTP "Session Management"),
@@ -1878,26 +1883,42 @@ class MCPServerTask:
             return True
         return False
 
-    async def _wait_for_reconnect_or_shutdown(self) -> str:
+    async def _wait_for_reconnect_or_shutdown(
+        self, timeout: Optional[float] = None
+    ) -> str:
         """Block until a reconnect or shutdown is requested while parked.
 
         Used by :meth:`run` after the reconnect budget is exhausted. The
         task stays alive (so ``_reconnect_event`` always has a listener) but
-        does no work until something explicitly asks it to come back —
-        the circuit-breaker half-open probe, OAuth recovery, or a manual
-        ``/mcp`` refresh.
+        does no work until something asks it to come back — the
+        circuit-breaker half-open probe, OAuth recovery, a manual ``/mcp``
+        refresh, or (HuanXing) its own ``timeout``-driven self-probe.
+
+        HuanXing addition — ``timeout``: without it a parked server waits
+        FOREVER for an *external* signal. But an idle server that dropped on
+        a network outage / cloud-unreachable (no tool call to trip the
+        breaker, no auth error, no manual click) has no such signal, so
+        network recovery would never reconnect it (permanently wedged). With
+        ``timeout`` set, the wait returns ``"reprobe"`` when neither event
+        fires within the window, so the caller rebuilds the transport and
+        self-heals on its own. It's throttled by ``timeout`` (one attempt per
+        window) and non-destructive (rebuild only — no credential re-mint), so
+        it can't cause a reconnect storm.
 
         Returns:
             ``"shutdown"`` if the server should exit the run loop entirely,
-            ``"reconnect"`` if it should rebuild the transport. The reconnect
-            event is cleared before returning so the next park cycle starts
-            from a fresh signal. Shutdown takes precedence.
+            ``"reconnect"`` if an explicit signal asked it to rebuild the
+            transport, or ``"reprobe"`` if ``timeout`` elapsed with no signal
+            (self-probe). The reconnect event is cleared before returning a
+            ``"reconnect"`` so the next park cycle starts from a fresh signal.
+            Shutdown takes precedence.
         """
         shutdown_task = asyncio.ensure_future(self._shutdown_event.wait())
         reconnect_task = asyncio.ensure_future(self._reconnect_event.wait())
         try:
             await asyncio.wait(
                 {shutdown_task, reconnect_task},
+                timeout=timeout,
                 return_when=asyncio.FIRST_COMPLETED,
             )
         finally:
@@ -1910,8 +1931,11 @@ class MCPServerTask:
                         pass
         if self._shutdown_event.is_set():
             return "shutdown"
-        self._reconnect_event.clear()
-        return "reconnect"
+        if self._reconnect_event.is_set():
+            self._reconnect_event.clear()
+            return "reconnect"
+        # timeout 到期、两个事件都没触发 → 自探（网络恢复自愈的关键路径）。
+        return "reprobe"
 
     async def _run_stdio(self, config: dict):
         """Run the server using stdio transport."""
@@ -2589,16 +2613,32 @@ class MCPServerTask:
                     # (HuanXing /v1/mcp/reconnect → reconnect_mcp_servers) —
                     # wakes us to rebuild the transport (respawning a dead
                     # stdio subprocess in the process).
+                    #
+                    # HuanXing: 但「断网/云端不可达」这一路根本没有上述任何外部信号
+                    # （没工具调用不跳熔断、非鉴权错误、没人点重连），干等 =
+                    # 网络恢复后永不重连（正是「断网恢复也不重连」的根因）。故这里
+                    # 用带超时的等待：每隔 _PARKED_REPROBE_SECONDS 自探一次
+                    # （返回 "reprobe"），零外部依赖地自愈。自探非破坏（只重建
+                    # transport、不重铸凭据）且每 server 一个周期一次，不会成风暴。
                     self._deregister_tools()
                     self._reconnect_event.clear()
-                    parked = await self._wait_for_reconnect_or_shutdown()
+                    parked = await self._wait_for_reconnect_or_shutdown(
+                        timeout=_PARKED_REPROBE_SECONDS
+                    )
                     if parked == "shutdown":
                         return
-                    logger.info(
-                        "MCP server '%s': reconnect requested while parked; "
-                        "rebuilding transport.",
-                        self.name,
-                    )
+                    if parked == "reprobe":
+                        logger.info(
+                            "MCP server '%s': parked self-probe — retrying "
+                            "the transport so idle network-recovery self-heals.",
+                            self.name,
+                        )
+                    else:
+                        logger.info(
+                            "MCP server '%s': reconnect requested while parked; "
+                            "rebuilding transport.",
+                            self.name,
+                        )
                     retries = 0
                     backoff = 1.0
                     continue

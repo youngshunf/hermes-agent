@@ -57,6 +57,67 @@ async def test_sleep_or_wake_shutdown_returns_promptly_not_woken():
 
 
 # --------------------------------------------------------------------------
+# _wait_for_reconnect_or_shutdown — parked self-probe (idle network-recovery)
+# --------------------------------------------------------------------------
+#
+# A server that dropped on a network outage / cloud-unreachable and then
+# exhausted its reconnect budget parks here. Without a timeout it waits
+# forever for an *external* signal (breaker half-open probe, OAuth recovery,
+# manual /v1/mcp/reconnect) — but an idle disconnect has none of those, so the
+# server stayed permanently wedged even after the network recovered. The
+# timeout returns "reprobe" so the run loop rebuilds the transport on its own.
+
+@pytest.mark.asyncio
+async def test_parked_wait_reprobes_on_timeout_with_no_signal():
+    """Timeout with neither event set → "reprobe" (self-heal, no external signal)."""
+    task = MCPServerTask("t")
+    start = time.monotonic()
+    result = await task._wait_for_reconnect_or_shutdown(timeout=0.05)
+    assert result == "reprobe"
+    assert time.monotonic() - start >= 0.04
+
+
+@pytest.mark.asyncio
+async def test_parked_wait_reconnect_signal_beats_timeout():
+    """An explicit reconnect signal returns "reconnect" and clears the event,
+    even with a timeout armed — the timeout is only a fallback self-probe."""
+    task = MCPServerTask("t")
+    task._reconnect_event.set()
+    start = time.monotonic()
+    result = await task._wait_for_reconnect_or_shutdown(timeout=5.0)
+    assert result == "reconnect"
+    assert not task._reconnect_event.is_set()
+    assert time.monotonic() - start < 1.0
+
+
+@pytest.mark.asyncio
+async def test_parked_wait_shutdown_takes_precedence():
+    """Shutdown wins over both timeout and reconnect so teardown is prompt."""
+    task = MCPServerTask("t")
+    task._shutdown_event.set()
+    start = time.monotonic()
+    result = await task._wait_for_reconnect_or_shutdown(timeout=5.0)
+    assert result == "shutdown"
+    assert time.monotonic() - start < 1.0
+
+
+@pytest.mark.asyncio
+async def test_parked_wait_without_timeout_still_blocks_for_signal():
+    """Backward-compat: with no timeout the wait blocks until a signal, then
+    returns "reconnect" (never "reprobe") — the legacy park-forever contract."""
+    task = MCPServerTask("t")
+
+    async def signal_later():
+        await asyncio.sleep(0.05)
+        task._reconnect_event.set()
+
+    signaller = asyncio.ensure_future(signal_later())
+    result = await task._wait_for_reconnect_or_shutdown()
+    await signaller
+    assert result == "reconnect"
+
+
+# --------------------------------------------------------------------------
 # get_mcp_status — error / retrying surfacing
 # --------------------------------------------------------------------------
 
