@@ -61,6 +61,9 @@ _HERMES_CORE_TOOLS = [
     # off every CLI/messaging/cron schema (narrow waist).
     # Session history search
     "session_search",
+    # 工具通道自愈（唤星新增）：本地 / 云端 MCP 通道掉线后，分身可自助调用
+    # reconnect_tools 重连恢复工具能力（原生工具，不依赖 MCP 通道，掉线时仍可调用）。
+    "reconnect_tools",
     # Clarifying questions
     "clarify",
     # Code execution + delegation
