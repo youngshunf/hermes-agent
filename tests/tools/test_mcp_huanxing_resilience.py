@@ -1,13 +1,16 @@
 """HuanXing MCP resilience patches for tools/mcp_tool.py.
 
-Covers the three behaviours added so an agent's cloud/local MCP servers no
-longer go permanently dead after a transient drop:
+上游（NousResearch/hermes-agent）已独立收敛出等价的 MCP 韧性机制：掉线后
+不永久放弃、停泊自探（``_wait_for_reconnect_or_shutdown`` 带 timeout 自愈）。
+本测试仅保留唤星**独有**的两块适配面：
 
-  - ``MCPServerTask._sleep_or_wake`` — interruptible reconnect backoff.
-  - ``get_mcp_status`` — surfaces *why* a server is disconnected and whether
-    its background task is still retrying.
-  - ``reconnect_mcp_servers`` — manual/daemon-driven teardown + rebuild from
-    fresh on-disk config (picks up rotated credentials), resets the breaker.
+  - ``get_mcp_status`` — 在服务器掉线时如实告诉主人「为什么断了」以及后台
+    任务是否仍在重试（``error`` / ``retrying`` / ``circuit_open`` 字段）。
+  - ``reconnect_mcp_servers`` — 手动 / 守护进程驱动的拆除 + 从磁盘最新配置
+    重建（拾取轮换后的凭据），并重置断路器。
+
+上游停泊自探统一返回 ``"reconnect"``（不再是唤星旧补丁的 ``"reprobe"``），
+且移除了 ``_sleep_or_wake``；相关测试已按上游契约对齐 / 删除。
 """
 import asyncio
 import time
@@ -19,44 +22,6 @@ from tools.mcp_tool import MCPServerTask
 
 
 # --------------------------------------------------------------------------
-# _sleep_or_wake — interruptible backoff
-# --------------------------------------------------------------------------
-
-@pytest.mark.asyncio
-async def test_sleep_or_wake_times_out_returns_false():
-    task = MCPServerTask("t")
-    start = time.monotonic()
-    woken = await task._sleep_or_wake(0.05)
-    assert woken is False
-    assert time.monotonic() - start >= 0.04
-
-
-@pytest.mark.asyncio
-async def test_sleep_or_wake_wakes_on_reconnect_event():
-    task = MCPServerTask("t")
-    task._reconnect_event.set()
-    start = time.monotonic()
-    woken = await task._sleep_or_wake(5.0)
-    assert woken is True
-    # Consumed so the next backoff cycle starts from a clean signal.
-    assert not task._reconnect_event.is_set()
-    # Returned promptly instead of waiting out the 5s window.
-    assert time.monotonic() - start < 1.0
-
-
-@pytest.mark.asyncio
-async def test_sleep_or_wake_shutdown_returns_promptly_not_woken():
-    task = MCPServerTask("t")
-    task._shutdown_event.set()
-    start = time.monotonic()
-    woken = await task._sleep_or_wake(5.0)
-    # Shutdown is not a manual reconnect, so the caller must not reset backoff,
-    # but teardown must still be prompt (not blocked for the full window).
-    assert woken is False
-    assert time.monotonic() - start < 1.0
-
-
-# --------------------------------------------------------------------------
 # _wait_for_reconnect_or_shutdown — parked self-probe (idle network-recovery)
 # --------------------------------------------------------------------------
 #
@@ -65,15 +30,16 @@ async def test_sleep_or_wake_shutdown_returns_promptly_not_woken():
 # forever for an *external* signal (breaker half-open probe, OAuth recovery,
 # manual /v1/mcp/reconnect) — but an idle disconnect has none of those, so the
 # server stayed permanently wedged even after the network recovered. The
-# timeout returns "reprobe" so the run loop rebuilds the transport on its own.
+# timeout returns "reconnect" so the run loop rebuilds the transport on its own
+# (上游统一命名为 "reconnect"，语义等同唤星旧补丁的 "reprobe" 自探).
 
 @pytest.mark.asyncio
 async def test_parked_wait_reprobes_on_timeout_with_no_signal():
-    """Timeout with neither event set → "reprobe" (self-heal, no external signal)."""
+    """Timeout with neither event set → "reconnect" (self-heal, no external signal)."""
     task = MCPServerTask("t")
     start = time.monotonic()
     result = await task._wait_for_reconnect_or_shutdown(timeout=0.05)
-    assert result == "reprobe"
+    assert result == "reconnect"
     assert time.monotonic() - start >= 0.04
 
 
