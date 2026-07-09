@@ -113,3 +113,95 @@ class TestResolveRuntimeAgentKwargsAuthFallback:
         assert calls == ["openrouter", "nous"]
         assert result["provider"] == "nous"
         assert result["model"] == "Hermes-4"
+
+    def test_fallback_api_key_env_uses_profile_secret_scope(self, tmp_path, monkeypatch):
+        """Fallback provider key_env/api_key_env must use the routed profile secret."""
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            "fallback_providers:\n"
+            "  - provider: custom\n"
+            "    model: qwen3.7-plus\n"
+            "    base_url: https://llm.dcfuture.cn/v1\n"
+            "    api_key_env: OPENAI_API_KEY\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+        from agent.secret_scope import reset_secret_scope, set_multiplex_active, set_secret_scope
+
+        token = set_secret_scope({"OPENAI_API_KEY": "sk-profile-owner"})
+        set_multiplex_active(True)
+        try:
+            def _mock_resolve(**kwargs):
+                assert kwargs["requested"] == "custom"
+                assert kwargs["explicit_base_url"] == "https://llm.dcfuture.cn/v1"
+                assert kwargs["explicit_api_key"] == "sk-profile-owner"
+                return {
+                    "api_key": kwargs["explicit_api_key"],
+                    "base_url": kwargs["explicit_base_url"],
+                    "provider": "custom",
+                    "api_mode": "chat_completions",
+                    "command": None,
+                    "args": None,
+                    "credential_pool": None,
+                }
+
+            with patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider",
+                side_effect=_mock_resolve,
+            ):
+                from gateway.run import _try_resolve_fallback_provider
+
+                result = _try_resolve_fallback_provider()
+        finally:
+            reset_secret_scope(token)
+            set_multiplex_active(False)
+
+        assert result["api_key"] == "sk-profile-owner"
+
+    def test_fallback_literal_env_template_uses_profile_secret_scope(self, tmp_path, monkeypatch):
+        """Existing profiles with api_key: ${OPENAI_API_KEY} must not pass the literal token."""
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            "fallback_providers:\n"
+            "  - provider: custom\n"
+            "    model: qwen3.7-plus\n"
+            "    base_url: https://llm.dcfuture.cn/v1\n"
+            "    api_key: ${OPENAI_API_KEY}\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+        from agent.secret_scope import reset_secret_scope, set_multiplex_active, set_secret_scope
+
+        token = set_secret_scope({"OPENAI_API_KEY": "sk-profile-owner"})
+        set_multiplex_active(True)
+        try:
+            def _mock_resolve(**kwargs):
+                assert kwargs["explicit_api_key"] == "sk-profile-owner"
+                return {
+                    "api_key": kwargs["explicit_api_key"],
+                    "base_url": kwargs["explicit_base_url"],
+                    "provider": "custom",
+                    "api_mode": "chat_completions",
+                    "command": None,
+                    "args": None,
+                    "credential_pool": None,
+                }
+
+            with patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider",
+                side_effect=_mock_resolve,
+            ):
+                from gateway.run import _try_resolve_fallback_provider
+
+                result = _try_resolve_fallback_provider()
+        finally:
+            reset_secret_scope(token)
+            set_multiplex_active(False)
+
+        assert result["api_key"] == "sk-profile-owner"

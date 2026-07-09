@@ -1888,6 +1888,40 @@ def _credential_pool_for_provider(provider: Optional[str]):
         return None
 
 
+_SECRET_REF_RE = re.compile(r"\${([^}]+)}")
+
+
+def _expand_gateway_secret_refs(value):
+    """Expand ${VAR} references through the profile-scoped secret resolver."""
+    if isinstance(value, str):
+        from agent.secret_scope import get_secret
+
+        return _SECRET_REF_RE.sub(
+            lambda match: get_secret(match.group(1), match.group(0)) or match.group(0),
+            value,
+        )
+    if isinstance(value, dict):
+        return {key: _expand_gateway_secret_refs(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_expand_gateway_secret_refs(item) for item in value]
+    return value
+
+
+def _fallback_api_key_from_entry(entry: dict) -> str | None:
+    """Resolve a fallback entry API key without leaking across multiplexed profiles."""
+    explicit_api_key = str(entry.get("api_key") or "").strip()
+    if explicit_api_key and not _SECRET_REF_RE.search(explicit_api_key):
+        return explicit_api_key
+
+    key_env = str(entry.get("key_env") or entry.get("api_key_env") or "").strip()
+    if not key_env:
+        return None
+
+    from agent.secret_scope import get_secret
+
+    return (get_secret(key_env, "") or "").strip() or None
+
+
 def _try_resolve_fallback_provider() -> dict | None:
     """Attempt to resolve credentials from the fallback_model/fallback_providers config."""
     from hermes_cli.runtime_provider import resolve_runtime_provider
@@ -1898,18 +1932,13 @@ def _try_resolve_fallback_provider() -> dict | None:
             return None
         with open(cfg_path, encoding="utf-8") as _f:
             cfg = _y.safe_load(_f) or {}
+        cfg = _expand_gateway_secret_refs(cfg)
         fb_list = get_fallback_chain(cfg)
         if not fb_list:
             return None
         for entry in fb_list:
             try:
-                explicit_api_key = entry.get("api_key")
-                if not explicit_api_key:
-                    key_env = str(
-                        entry.get("key_env") or entry.get("api_key_env") or ""
-                    ).strip()
-                    if key_env:
-                        explicit_api_key = os.getenv(key_env, "").strip() or None
+                explicit_api_key = _fallback_api_key_from_entry(entry)
                 runtime = resolve_runtime_provider(
                     requested=entry.get("provider"),
                     explicit_base_url=entry.get("base_url"),
