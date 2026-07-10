@@ -333,9 +333,19 @@ _MCP_LOG_LEVEL_MAP = {
 # ---------------------------------------------------------------------------
 
 _DEFAULT_TOOL_TIMEOUT = 300      # seconds for tool calls
-_DEFAULT_CONNECT_TIMEOUT = 60    # seconds for initial connection per server
+# 唤星补丁：初始连接超时从 60→25s。MCP 工具发现（discover_mcp_tools）在 agent 装配阶段
+# 同步执行，且发生在 gateway 的 api_server 控制面 bind 之前——一旦某个 MCP server（尤其
+# 云端 hasn_amk）过载/不可达，session.initialize() 会挂满 connect_timeout。60s × 多次初始
+# 重试可把控制面启动阻塞到 180s+，超过 daemon 的 ~150s 存活探测窗 → daemon 判「网关起不来」
+# → 重启 → 每次重启又发一轮云端 MCP 连接 → 正反馈雪崩（本地 dev 单进程后端被刷崩即此根因）。
+# 25s 对健康连接足够宽裕，对过载/断网则快速失败转后台停泊+自探复活，让控制面秒起、daemon
+# 探到就绪、停止重启。reconnect 路径复用同值，25s 亦够。
+_DEFAULT_CONNECT_TIMEOUT = 25    # seconds for initial connection per server
 _MAX_RECONNECT_RETRIES = 5
-_MAX_INITIAL_CONNECT_RETRIES = 3 # retries for the very first connection attempt
+# 唤星补丁：初始连接重试 3→1。配合上面 25s 超时，把「首次连接失败→停泊」的最长阻塞收到
+# ~2×25s＝50s（远小于 daemon ~150s 存活窗），云端过载/断网时快速让路给后台停泊+自探复活，
+# 而不是死等 3 轮把网关启动拖垮。保留 1 次重试以容忍启动瞬时抖动（DNS/网络毛刺不误杀）。
+_MAX_INITIAL_CONNECT_RETRIES = 1 # retries for the very first connection attempt
 _MAX_BACKOFF_SECONDS = 60
 # While parked (reconnect budget exhausted, tools deregistered) the run task
 # wakes on this cadence and attempts one revival probe. Without it a parked
