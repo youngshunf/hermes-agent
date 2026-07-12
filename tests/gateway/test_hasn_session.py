@@ -2,14 +2,16 @@
 
 覆盖 ``gateway.hasn_session``：
 - ``set/get/reset`` ContextVar 任务局部、空值归一；
-- ``stamp_session_arg`` 纯函数：只对本地 ``hasn`` 服务打标、覆盖式注入、无会话时
-  strip 掉 LLM 误填的保留参数、第三方服务原样、不修改入参。
+- ``stamp_session_arg`` 纯函数：对唤星自有服务（``hasn`` 本地 + ``cloud`` 云端平台工具）
+  打标、覆盖式注入、无会话时 strip 掉 LLM 误填的保留参数、第三方服务原样、不修改入参。
 """
 
 import pytest
 
 from gateway.hasn_session import (
+    HASN_CLOUD_MCP_SERVER,
     HASN_LOCAL_MCP_SERVER,
+    HASN_STAMPED_MCP_SERVERS,
     RESERVED_SESSION_ARG,
     get_hasn_session_id,
     reset_hasn_session_id,
@@ -32,6 +34,9 @@ def test_reserved_arg_matches_rust_contract():
     # 与 hasn-mcp(Rust) auth.rs::RESERVED_SESSION_ARG 严格一致。
     assert RESERVED_SESSION_ARG == "_hasn_session_id"
     assert HASN_LOCAL_MCP_SERVER == "hasn"
+    # 云端平台工具直连服务名与 profile_config.py mcp_servers["cloud"] 一致。
+    assert HASN_CLOUD_MCP_SERVER == "cloud"
+    assert HASN_STAMPED_MCP_SERVERS == {"hasn", "cloud"}
 
 
 def test_set_get_reset_roundtrip():
@@ -53,12 +58,15 @@ def test_blank_session_id_normalizes_to_none():
 def test_stamp_injects_session_id_for_hasn_server():
     token = set_hasn_session_id("work-session-7")
     try:
-        original = {"question": "继续吗？"}
-        out = stamp_session_arg("hasn", original)
-        assert out[RESERVED_SESSION_ARG] == "work-session-7"
-        assert out["question"] == "继续吗？"
-        # 不修改入参（immutable）。
-        assert RESERVED_SESSION_ARG not in original
+        # hasn 本地 + cloud 云端平台工具两个自有服务都打标（云端 register-on-write
+        # 依赖它把 deck 等产物登记进工作会话资源栏）。
+        for server in ("hasn", "cloud"):
+            original = {"question": "继续吗？"}
+            out = stamp_session_arg(server, original)
+            assert out[RESERVED_SESSION_ARG] == "work-session-7"
+            assert out["question"] == "继续吗？"
+            # 不修改入参（immutable）。
+            assert RESERVED_SESSION_ARG not in original
     finally:
         reset_hasn_session_id(token)
 
@@ -81,12 +89,12 @@ def test_stamp_strips_llm_injected_arg_when_no_session():
     assert out["q"] == 1
 
 
-def test_stamp_noop_for_non_hasn_server():
-    # cloud 平台工具 / 第三方 MCP 绝不注入（它们不 strip 该保留参数）。
+def test_stamp_noop_for_third_party_server():
+    # 第三方 MCP 绝不注入（它们不 strip 该保留参数，注入即污染入参 schema）。
     token = set_hasn_session_id("work-session-7")
     try:
         original = {"x": 1}
-        for server in ("cloud", "qcc", "filesystem"):
+        for server in ("qcc", "filesystem", "slack"):
             out = stamp_session_arg(server, original)
             assert out is original
             assert RESERVED_SESSION_ARG not in out

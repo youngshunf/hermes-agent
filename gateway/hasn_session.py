@@ -22,8 +22,9 @@ session_id)``，``tools/mcp_tool.py`` 的工具处理器在把参数交给 ``ses
 ``server.rs`` 会 strip 掉该保留参数，并在「无 auth 绑定会话」（内置 Hermes 的本地 key 是
 per-(owner,agent) 会话无关）时采纳它作为本次调用的会话身份。
 
-只对 ``hasn`` 这个本地 daemon MCP 服务打标：cloud 平台工具服务（``cloud``）与第三方 MCP
-不会 strip 该参数，注入会污染它们的入参 schema。
+只对唤星自有的两个 MCP 服务打标（``hasn`` 本地 daemon + ``cloud`` 云端平台工具直连）：
+两者都会在 server 侧 strip 掉该保留参数（hasn-mcp ``server.rs`` / 云端 ``server.call_tool``
+的 register-on-write 提取点，ARTREG-2）；第三方 MCP 不 strip，注入会污染入参 schema，绝不打标。
 """
 
 from __future__ import annotations
@@ -35,8 +36,17 @@ from typing import Any, Mapping, Optional
 RESERVED_SESSION_ARG = "_hasn_session_id"
 
 # 本地 daemon MCP 服务在 Hermes 配置里的固定名字（见 huanxing_hermes_runtime
-# profile_config.py：``mcp_servers["hasn"]``）。只有它会 strip 保留参数。
+# profile_config.py：``mcp_servers["hasn"]``）。
 HASN_LOCAL_MCP_SERVER = "hasn"
+
+# 云端平台工具 MCP 服务（profile_config.py：``mcp_servers["cloud"]``，直连云端
+# /api/v1/mcp/streamable）。云端 server.call_tool 同样剥离保留参数并落
+# AgentContext.work_session_id（register-on-write），故一并打标——否则 deck 等
+# 云端平台工具的产物登记不带工作会话 id，会话资源栏看不到本次产出（血泪 bug）。
+HASN_CLOUD_MCP_SERVER = "cloud"
+
+# 会被系统打标 ``_hasn_session_id`` 的唤星自有 MCP 服务全集（server 侧都会 strip）。
+HASN_STAMPED_MCP_SERVERS = frozenset({HASN_LOCAL_MCP_SERVER, HASN_CLOUD_MCP_SERVER})
 
 # 任务局部的当前 run 会话 id（daemon 透传的 ``session_id``）。并发会话互不串扰。
 _HASN_SESSION_ID: "ContextVar[Optional[str]]" = ContextVar(
@@ -66,15 +76,16 @@ def get_hasn_session_id() -> Optional[str]:
 
 
 def stamp_session_arg(server_name: str, args: Any) -> Any:
-    """对**本地 hasn MCP 服务**的出站调用参数注入系统侧 ``_hasn_session_id``。
+    """对**唤星自有 MCP 服务**（``hasn`` 本地 / ``cloud`` 云端平台工具）的出站调用参数
+    注入系统侧 ``_hasn_session_id``。
 
     纯函数，不修改入参（immutable：命中时返回新 dict）。规则：
 
-    - 非 ``hasn`` 本地服务（cloud 平台工具 / 第三方 MCP）→ 原样返回，绝不注入；
+    - 非唤星自有服务（第三方 MCP）→ 原样返回，绝不注入（它们不 strip，注入即污染）；
     - 当前 run 有会话 id → 覆盖式写入 ``_hasn_session_id``（分身无法控制它）；
     - 当前 run 无会话 id → strip 掉 LLM 误填的 ``_hasn_session_id``（杜绝分身自填注入）。
     """
-    if server_name != HASN_LOCAL_MCP_SERVER:
+    if server_name not in HASN_STAMPED_MCP_SERVERS:
         return args
     if not isinstance(args, Mapping):
         return args
