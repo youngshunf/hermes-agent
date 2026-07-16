@@ -32,16 +32,13 @@ vi.mock('@/store/notifications', () => ({
 type Controls = ReturnType<typeof useModelControls>
 
 function Harness({
-  activeSessionId,
   onReady,
   requestGateway
 }: {
-  activeSessionId: string | null
   onReady: (controls: Controls) => void
   requestGateway: <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>
 }) {
   const controls = useModelControls({
-    activeSessionId,
     queryClient: new QueryClient(),
     requestGateway
   })
@@ -74,7 +71,6 @@ describe('useModelControls', () => {
 
     const { result } = renderHook(() =>
       useModelControls({
-        activeSessionId: null,
         queryClient: new QueryClient(),
         requestGateway: vi.fn()
       })
@@ -97,7 +93,6 @@ describe('useModelControls', () => {
 
     const { result } = renderHook(() =>
       useModelControls({
-        activeSessionId: 'runtime-1',
         queryClient: new QueryClient(),
         requestGateway: vi.fn()
       })
@@ -109,13 +104,12 @@ describe('useModelControls', () => {
     expect($currentProvider.get()).toBe('deepseek')
   })
 
-  it('routes active-session picker changes through config.set with an explicit provider', async () => {
+  it('routes active-session picker changes through config.set with an explicit session-scoped provider', async () => {
+    $activeSessionId.set('session-1')
     const requestGateway = vi.fn(async () => ({ key: 'model', value: 'claude-sonnet-4.6' }) as never)
     let controls!: Controls
 
-    render(
-      <Harness activeSessionId="session-1" onReady={value => (controls = value)} requestGateway={requestGateway} />
-    )
+    render(<Harness onReady={value => (controls = value)} requestGateway={requestGateway} />)
 
     await expect(
       controls.selectModel({
@@ -127,16 +121,37 @@ describe('useModelControls', () => {
     expect(requestGateway).toHaveBeenCalledWith('config.set', {
       session_id: 'session-1',
       key: 'model',
-      value: 'claude-sonnet-4.6 --provider anthropic'
+      value: 'claude-sonnet-4.6 --provider anthropic --session'
     })
     expect(requestGateway).not.toHaveBeenCalledWith('slash.exec', expect.anything())
+  })
+
+  it('session-scopes MoA preset selections so they cannot persist as the global gateway default', async () => {
+    $activeSessionId.set('session-1')
+    const requestGateway = vi.fn(async () => ({ key: 'model', value: 'BeastMode' }) as never)
+    let controls!: Controls
+
+    render(<Harness onReady={value => (controls = value)} requestGateway={requestGateway} />)
+
+    await expect(
+      controls.selectModel({
+        model: 'BeastMode',
+        provider: 'moa'
+      })
+    ).resolves.toBe(true)
+
+    expect(requestGateway).toHaveBeenCalledWith('config.set', {
+      session_id: 'session-1',
+      key: 'model',
+      value: 'BeastMode --provider moa --session'
+    })
   })
 
   it('stores a no-session pick as UI state with no gateway or global write', async () => {
     const requestGateway = vi.fn()
     let controls!: Controls
 
-    render(<Harness activeSessionId={null} onReady={value => (controls = value)} requestGateway={requestGateway} />)
+    render(<Harness onReady={value => (controls = value)} requestGateway={requestGateway} />)
 
     await expect(
       controls.selectModel({
@@ -158,7 +173,6 @@ describe('useModelControls', () => {
 
     const { result } = renderHook(() =>
       useModelControls({
-        activeSessionId: null,
         queryClient: new QueryClient(),
         requestGateway: vi.fn()
       })
