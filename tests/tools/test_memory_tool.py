@@ -1010,6 +1010,10 @@ class TestOwnerMemoryObserver:
                 memory_tool(action="add", target="user", content="主人是后端工程师", store=user_store)
             )
             assert result["success"] is True
-            assert "主人是后端工程师" in result["entries"]
+            # 断言「写入真的落地」而非回显字段——上游会改返回结构（曾用 entries，
+            # 现为 entry_count/usage），断言活状态+落盘才是这条测试的本意，
+            # 也不会被上游下一次改返回体带红。
+            assert "主人是后端工程师" in user_store.user_entries
+            assert "主人是后端工程师" in (user_store._path_for("user")).read_text()
         finally:
             set_owner_memory_observer(None)

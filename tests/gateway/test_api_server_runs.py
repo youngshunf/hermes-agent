@@ -578,6 +578,76 @@ class TestRunEvents:
                 assert "run.failed" in body
                 assert "empty response" in body
 
+    async def _run_and_capture_hasn_session(self, adapter, cli, body):
+        """跑一个 run，回收 run_conversation 执行线程里看到的 _hasn_session_id。"""
+        from gateway.hasn_session import get_hasn_session_id
+
+        seen = {}
+
+        def _capture(**_kwargs):
+            # 分身真正干活的线程——本地 hasn MCP 工具就是在这里读会话戳的
+            seen["session_id"] = get_hasn_session_id()
+            return {"final_response": "ok"}
+
+        with patch.object(adapter, "_create_agent") as mock_create:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.side_effect = _capture
+            mock_agent.session_prompt_tokens = 0
+            mock_agent.session_completion_tokens = 0
+            mock_agent.session_total_tokens = 0
+            mock_create.return_value = mock_agent
+
+            resp = await cli.post("/v1/runs", json=body)
+            assert resp.status == 202
+            run_id = (await resp.json())["run_id"]
+            # 拉完事件流 = 等 run 真的跑完，之后 seen 才有值
+            await (await cli.get(f"/v1/runs/{run_id}/events")).text()
+        return seen
+
+    @pytest.mark.asyncio
+    async def test_hasn_session_id_bound_to_run_thread(self, adapter):
+        """唤星会话绑定：daemon 透传的 session_id 必须绑到 run 的执行线程。
+
+        断链后果：本地 hasn MCP 工具拿不到 _hasn_session_id，分身的提问卡/产物
+        回不到发起它的那个 session。上游把 run 包进 _profile_scope 时正好撞这段
+        （2026-07-16 合并冲突 #2/#3），故钉死。
+        """
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            seen = await self._run_and_capture_hasn_session(
+                adapter, cli, {"input": "hi", "session_id": "conv_x__peer_h_friend"}
+            )
+        assert seen["session_id"] == "conv_x__peer_h_friend"
+
+    @pytest.mark.asyncio
+    async def test_hasn_session_id_not_bound_without_explicit_session(self, adapter):
+        """没送 session_id 就不绑——run_id 兜底不是真实会话，绑了反而误导分身。"""
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            seen = await self._run_and_capture_hasn_session(adapter, cli, {"input": "hi"})
+        assert seen["session_id"] is None
+
+    @pytest.mark.asyncio
+    async def test_hasn_session_id_reset_after_run(self, adapter, monkeypatch):
+        """finally 里必须 reset——线程池会复用线程，不 reset 会把上一个会话的
+        戳串给下一个 run（发错 session 的经典形状）。"""
+        import gateway.hasn_session as hasn_session
+
+        resets = []
+        real_reset = hasn_session.reset_hasn_session_id
+        monkeypatch.setattr(
+            hasn_session,
+            "reset_hasn_session_id",
+            lambda token: (resets.append(token), real_reset(token))[1],
+        )
+
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            await self._run_and_capture_hasn_session(
+                adapter, cli, {"input": "hi", "session_id": "conv_reset_me"}
+            )
+        assert len(resets) == 1
+
     @pytest.mark.asyncio
     async def test_approval_resolve_all_is_scoped_to_target_run(self, auth_adapter):
         """Same client session_id must not let one run approve another run's queue."""
