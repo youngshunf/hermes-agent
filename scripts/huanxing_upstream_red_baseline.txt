@@ -1,0 +1,67 @@
+# 上游自带红测试基线（macOS 开发机）
+#
+# 这里每一行是一个**跑 ./scripts/run_tests.sh 全量时会红、但与唤星 fork 无关**的测试文件。
+# 由 ./scripts/huanxing_merge_gate.sh --full 消费：红文件集必须 ⊆ 本表，
+# **出现表外的新红 = 本次合并引入的回归 = 闸门失败**。
+#
+# ── 这些红是怎么认定为「上游自带」的（不是拍脑袋）────────────────────────────
+# 2026-07-16 合并上游时用实验证的，不是靠推断：
+#   1. 在 fork(huanxing) 上跑全量 → 得到红文件集；
+#   2. 另开一个**纯 upstream/main** 的 git worktree（不含我们任何改动），
+#      对同一批文件跑同一个 run_tests.sh；
+#   3. 逐个对照 —— 在纯上游同样红的，就是上游/环境自带，与我们无关。
+# 结论：24 个红里 22 个在纯上游一模一样地红。另 2 个已单独查清，见文末。
+#
+# 为什么上游 CI 是绿的、我们这里却红：上游 CI 跑 Linux，这批红基本是 macOS 特有
+# （平台差异、路径/权限语义、依赖在 darwin 上的行为差异），CI 根本跑不到。
+# 我们不承担替上游修 macOS 兼容性的义务——但必须**知道它们红**，
+# 且**不许它们掩护我们自己的回归**，这正是本表存在的意义。
+#
+# ── 维护规矩 ────────────────────────────────────────────────────────────────
+# * 往表里加行 = 声明「这个红不是我们造成的」。加之前必须先在纯上游 worktree
+#   验证过它同样红，**不许为了让闸门变绿而随手往里加**——那等于把闸门废掉。
+# * 闸门跑完会提示「基线里这些文件现在是绿的」，见到就把对应行删掉，保持表精简。
+# * 每行只写仓库相对路径，# 开头为注释。
+#
+# ── 两个需要单独说明的条目 ──────────────────────────────────────────────────
+# * tests/providers/test_plugin_discovery.py —— **不在表内，勿加回**
+#     曾在本机红：plugins/model-providers/ 下多了个**空目录** ai-gateway（git 不
+#     追踪空目录，故 git status 一直干净、极具迷惑性），而该测试要求每个子目录都
+#     带 __init__.py。删掉空目录即绿。属本机残渣，不是缺陷，故不进基线。
+#     以后再见它红 → 先 `ls plugins/model-providers/` 找空目录，别当回归查。
+# * tests/tools/test_base_environment.py —— **在表内，但性质不同**
+#     ::test_concurrent_writes_never_tear_the_snapshot 单跑即绿，是 20 worker
+#     满载下的并发抖动，不是上游缺陷。仍收进基线，因为两次全量它都红——满载下它
+#     是稳定红，排除它只会让闸门每次都失败、进而被无视，那才是真正的损失。
+#     代价：这个文件里的真回归会被掩护。**若要改这个文件所在的代码域，请单独跑它。**
+#
+# ── 上游自带红的数据（2026-07-16 全量实测）────────────────────────────────
+# 2044 files / 41882 passed / 59 failed / 23 个红文件 / 883.8s（20 workers）。
+# 23 个红里 **0 个是 fork 触碰的文件**；22 个已在纯 upstream/main worktree 验证同样红，
+# 另 1 个（test_base_environment）是上面说的满载抖动。
+#
+# 基线生成时间：2026-07-16（合并上游 hermes-agent 之后）
+
+tests/agent/test_anthropic_adapter.py
+tests/agent/test_anthropic_output_field_leak.py
+tests/agent/test_credential_pool_oat_authtype.py
+tests/gateway/test_background_command.py
+tests/gateway/test_discord_document_handling.py
+tests/gateway/test_feishu.py
+tests/gateway/test_matrix.py
+tests/gateway/test_shutdown_forensics.py
+tests/hermes_cli/test_gateway_service.py
+tests/hermes_cli/test_gateway_wsl.py
+tests/hermes_cli/test_model_switch_custom_providers.py
+tests/hermes_cli/test_service_manager.py
+tests/hermes_cli/test_signal_handler_kanban_worker.py
+tests/hermes_cli/test_xai_curated_models.py
+tests/run_agent/test_run_agent.py
+tests/test_live_system_guard_self_test.py
+tests/test_model_tools_async_bridge.py
+tests/tools/test_approval.py
+tests/tools/test_base_environment.py
+tests/tools/test_browser_hybrid_routing.py
+tests/tools/test_file_tools.py
+tests/tools/test_web_providers.py
+tests/tools/test_web_tools_tavily.py
