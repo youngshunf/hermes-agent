@@ -4983,7 +4983,9 @@ class APIServerAdapter(BasePlatformAdapter):
 
                 def _run_sync():
                     from gateway.hasn_session import (
+                        reset_hasn_project_id,
                         reset_hasn_session_id,
+                        set_hasn_project_id,
                         set_hasn_session_id,
                     )
                     from gateway.session_context import clear_session_vars
@@ -5003,6 +5005,12 @@ class APIServerAdapter(BasePlatformAdapter):
                     # 仅当调用方真送了 session_id 才绑（run_id 兜底不是真实会话，绑了反而误导）。
                     hasn_session_token = None
                     daemon_session_id = body.get("session_id") or stored_session_id
+                    # PJ U5b：把 daemon 透传的 project_id 与会话 id 同轨绑到本 run 执行线程，
+                    # 供本地 hasn / cloud 平台工具系统侧注入 ``_hasn_project_id``——云端
+                    # register-on-write 据此把产出资源打到项目名下。非项目派发时 body 无
+                    # ``project_id`` ⇒ None（不绑、不注入，零影响面）。
+                    hasn_project_token = None
+                    daemon_project_id = body.get("project_id")
                     with self._profile_scope(request_profile):
                         try:
                             # Bind approval/session identity for this API run via
@@ -5014,6 +5022,8 @@ class APIServerAdapter(BasePlatformAdapter):
                             )
                             if daemon_session_id:
                                 hasn_session_token = set_hasn_session_id(daemon_session_id)
+                            if daemon_project_id:
+                                hasn_project_token = set_hasn_project_id(daemon_project_id)
                             register_gateway_notify(approval_session_key, _approval_notify)
                             r = agent.run_conversation(
                                 user_message=user_message,
@@ -5021,6 +5031,11 @@ class APIServerAdapter(BasePlatformAdapter):
                                 task_id=effective_task_id,
                             )
                         finally:
+                            if hasn_project_token is not None:
+                                try:
+                                    reset_hasn_project_id(hasn_project_token)
+                                except Exception:
+                                    pass
                             if hasn_session_token is not None:
                                 try:
                                     reset_hasn_session_id(hasn_session_token)

@@ -112,11 +112,18 @@ logger = logging.getLogger(__name__)
 
 # 唤星会话绑定（提问卡修复）：对本地 hasn MCP 调用注入系统侧 ``_hasn_session_id``，
 # 让「向主人提问」类工具回到发起这次派发的会话（哪个 session 发就回哪个 session）。
+# 唤星项目绑定（PJ U5b）：同轨注入系统侧 ``_hasn_project_id``，供云端 register-on-write
+# 把产出资源打到当次派发所属的平台项目名下。两者都只对唤星自有 MCP 服务打标。
 # gateway 在某些进程（CLI/cron）可能不可导入 → 此处为 None，工具调用照常、不打标。
 try:
     from gateway.hasn_session import stamp_session_arg as _stamp_hasn_session_arg
 except Exception:  # pragma: no cover - gateway 不可导入的进程（CLI/cron）
     _stamp_hasn_session_arg = None
+
+try:
+    from gateway.hasn_session import stamp_project_arg as _stamp_hasn_project_arg
+except Exception:  # pragma: no cover - gateway 不可导入的进程（CLI/cron）
+    _stamp_hasn_project_arg = None
 
 # Upper bound for the OSV malware preflight during stdio MCP startup. The
 # check makes a blocking urllib HTTPS call whose own timeout can fail to
@@ -4077,6 +4084,17 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             except Exception:
                 logger.debug(
                     "MCP server '%s': stamp _hasn_session_id failed (ignored)",
+                    server_name,
+                )
+        # 唤星补丁（PJ U5b）：同轨注入 _hasn_project_id，让云端 register-on-write
+        # 把产出资源打到当次派发所属的平台项目名下。在 session 打标之后链式调用，
+        # 两者各增删自己的保留键、互不干扰。失败不阻断调用。
+        if _stamp_hasn_project_arg is not None:
+            try:
+                args = _stamp_hasn_project_arg(server_name, args)
+            except Exception:
+                logger.debug(
+                    "MCP server '%s': stamp _hasn_project_id failed (ignored)",
                     server_name,
                 )
         # Circuit breaker: if this server has failed too many times

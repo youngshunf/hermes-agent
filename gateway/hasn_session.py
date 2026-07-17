@@ -35,6 +35,11 @@ from typing import Any, Mapping, Optional
 # 与 hasn-mcp（Rust）auth.rs::RESERVED_SESSION_ARG 严格一致。
 RESERVED_SESSION_ARG = "_hasn_session_id"
 
+# 与 hasn-mcp（Rust）auth.rs::RESERVED_PROJECT_ARG + 云端 _project_id_var 提取键
+# 严格一致（PJ U5b）。本次派发所属的平台项目 id，随会话身份一同系统注入，供云端
+# register-on-write 把产出资源打到项目名下；分身（LLM）不允许、也不需要自己填。
+RESERVED_PROJECT_ARG = "_hasn_project_id"
+
 # 本地 daemon MCP 服务在 Hermes 配置里的固定名字（见 huanxing_hermes_runtime
 # profile_config.py：``mcp_servers["hasn"]``）。
 HASN_LOCAL_MCP_SERVER = "hasn"
@@ -51,6 +56,12 @@ HASN_STAMPED_MCP_SERVERS = frozenset({HASN_LOCAL_MCP_SERVER, HASN_CLOUD_MCP_SERV
 # 任务局部的当前 run 会话 id（daemon 透传的 ``session_id``）。并发会话互不串扰。
 _HASN_SESSION_ID: "ContextVar[Optional[str]]" = ContextVar(
     "HUANXING_HASN_SESSION_ID", default=None
+)
+
+# 任务局部的当前 run 平台项目 id（daemon 透传的 ``project_id``）。与会话 id 同轨、
+# 并发派发互不串扰；非项目派发时为 ``None``（云端 register-on-write 不打标，零影响面）。
+_HASN_PROJECT_ID: "ContextVar[Optional[str]]" = ContextVar(
+    "HUANXING_HASN_PROJECT_ID", default=None
 )
 
 
@@ -75,6 +86,26 @@ def get_hasn_session_id() -> Optional[str]:
     return _HASN_SESSION_ID.get()
 
 
+def set_hasn_project_id(project_id: Optional[str]) -> Token:
+    """绑定当前 run 的平台项目 id，返回 reset token（在 ``finally`` 里 ``reset_hasn_project_id``）。
+
+    与 ``set_hasn_session_id`` 同轨：传入空/None 表示「本次派发不属于任何项目」，此时
+    ``get_hasn_project_id`` 返回 ``None``，工具处理器不注入、并 strip 掉 LLM 误填的保留参数。
+    """
+    normalized = project_id.strip() if isinstance(project_id, str) else None
+    return _HASN_PROJECT_ID.set(normalized or None)
+
+
+def reset_hasn_project_id(token: Token) -> None:
+    """复原 ``set_hasn_project_id`` 的绑定（run 结束时调用，保持任务局部不外泄）。"""
+    _HASN_PROJECT_ID.reset(token)
+
+
+def get_hasn_project_id() -> Optional[str]:
+    """读取当前 run 的平台项目 id；未绑定/为空返回 ``None``。"""
+    return _HASN_PROJECT_ID.get()
+
+
 def stamp_session_arg(server_name: str, args: Any) -> Any:
     """对**唤星自有 MCP 服务**（``hasn`` 本地 / ``cloud`` 云端平台工具）的出站调用参数
     注入系统侧 ``_hasn_session_id``。
@@ -94,4 +125,28 @@ def stamp_session_arg(server_name: str, args: Any) -> Any:
         return {**args, RESERVED_SESSION_ARG: session_id}
     if RESERVED_SESSION_ARG in args:
         return {key: value for key, value in args.items() if key != RESERVED_SESSION_ARG}
+    return args
+
+
+def stamp_project_arg(server_name: str, args: Any) -> Any:
+    """对**唤星自有 MCP 服务**（``hasn`` 本地 / ``cloud`` 云端平台工具）的出站调用参数
+    注入系统侧 ``_hasn_project_id``（PJ U5b）。
+
+    与 ``stamp_session_arg`` 同规则、同不变量（纯函数、不修改入参、只对唤星自有服务打标）：
+
+    - 非唤星自有服务（第三方 MCP）→ 原样返回，绝不注入（它们不 strip，注入即污染 schema）；
+    - 当前 run 有项目 id → 覆盖式写入 ``_hasn_project_id``（分身无法控制它）；
+    - 当前 run 无项目 id → strip 掉 LLM 误填的 ``_hasn_project_id``（杜绝分身自填注入）。
+
+    应在 ``stamp_session_arg`` 之后链式调用（两者互不干扰，各自增删自己的保留键）。
+    """
+    if server_name not in HASN_STAMPED_MCP_SERVERS:
+        return args
+    if not isinstance(args, Mapping):
+        return args
+    project_id = get_hasn_project_id()
+    if project_id:
+        return {**args, RESERVED_PROJECT_ARG: project_id}
+    if RESERVED_PROJECT_ARG in args:
+        return {key: value for key, value in args.items() if key != RESERVED_PROJECT_ARG}
     return args

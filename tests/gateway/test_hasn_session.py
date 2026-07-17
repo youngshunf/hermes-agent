@@ -1,9 +1,11 @@
-"""唤星会话绑定载体（提问卡修复）单测。
+"""唤星会话绑定载体（提问卡修复）+ 项目绑定载体（PJ U5b）单测。
 
 覆盖 ``gateway.hasn_session``：
-- ``set/get/reset`` ContextVar 任务局部、空值归一；
-- ``stamp_session_arg`` 纯函数：对唤星自有服务（``hasn`` 本地 + ``cloud`` 云端平台工具）
-  打标、覆盖式注入、无会话时 strip 掉 LLM 误填的保留参数、第三方服务原样、不修改入参。
+- ``set/get/reset`` ContextVar 任务局部、空值归一（会话与项目两条轨各一套）；
+- ``stamp_session_arg`` / ``stamp_project_arg`` 纯函数：对唤星自有服务（``hasn`` 本地 +
+  ``cloud`` 云端平台工具）打标、覆盖式注入、无值时 strip 掉 LLM 误填的保留参数、第三方
+  服务原样、不修改入参；
+- 两条轨链式调用互不干扰（各增删自己的保留键）。
 """
 
 import pytest
@@ -12,10 +14,15 @@ from gateway.hasn_session import (
     HASN_CLOUD_MCP_SERVER,
     HASN_LOCAL_MCP_SERVER,
     HASN_STAMPED_MCP_SERVERS,
+    RESERVED_PROJECT_ARG,
     RESERVED_SESSION_ARG,
+    get_hasn_project_id,
     get_hasn_session_id,
+    reset_hasn_project_id,
     reset_hasn_session_id,
+    set_hasn_project_id,
     set_hasn_session_id,
+    stamp_project_arg,
     stamp_session_arg,
 )
 
@@ -109,3 +116,122 @@ def test_stamp_tolerates_non_mapping_args():
         assert stamp_session_arg("hasn", "raw") == "raw"
     finally:
         reset_hasn_session_id(token)
+
+
+# ---------------------------------------------------------------------------
+# PJ U5b：项目绑定轨（与会话轨同规约、独立键）
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _clear_project():
+    """每个用例前后归零项目 ContextVar，避免跨用例串味。"""
+    token = set_hasn_project_id(None)
+    try:
+        yield
+    finally:
+        reset_hasn_project_id(token)
+
+
+def test_project_reserved_arg_matches_rust_contract():
+    # 与 hasn-mcp(Rust) auth.rs::RESERVED_PROJECT_ARG + 云端 _project_id_var 提取键严格一致。
+    assert RESERVED_PROJECT_ARG == "_hasn_project_id"
+
+
+def test_project_set_get_reset_roundtrip():
+    assert get_hasn_project_id() is None
+    token = set_hasn_project_id("proj-1")
+    assert get_hasn_project_id() == "proj-1"
+    reset_hasn_project_id(token)
+    assert get_hasn_project_id() is None
+
+
+def test_blank_project_id_normalizes_to_none():
+    token = set_hasn_project_id("   ")
+    try:
+        assert get_hasn_project_id() is None
+    finally:
+        reset_hasn_project_id(token)
+
+
+def test_stamp_injects_project_id_for_hasn_and_cloud():
+    token = set_hasn_project_id("proj-7")
+    try:
+        for server in ("hasn", "cloud"):
+            original = {"title": "季度复盘"}
+            out = stamp_project_arg(server, original)
+            assert out[RESERVED_PROJECT_ARG] == "proj-7"
+            assert out["title"] == "季度复盘"
+            # 不修改入参（immutable）。
+            assert RESERVED_PROJECT_ARG not in original
+    finally:
+        reset_hasn_project_id(token)
+
+
+def test_stamp_overwrites_llm_provided_project_id():
+    # 分身不允许自填——系统值覆盖 LLM 值。
+    token = set_hasn_project_id("authoritative-project")
+    try:
+        out = stamp_project_arg("hasn", {RESERVED_PROJECT_ARG: "llm-faked"})
+        assert out[RESERVED_PROJECT_ARG] == "authoritative-project"
+    finally:
+        reset_hasn_project_id(token)
+
+
+def test_stamp_strips_llm_injected_project_arg_when_no_project():
+    # 无 run 项目时（非项目派发），绝不让 LLM 误填的保留参数漏到 daemon/云端。
+    assert get_hasn_project_id() is None
+    out = stamp_project_arg("hasn", {RESERVED_PROJECT_ARG: "llm-faked", "q": 1})
+    assert RESERVED_PROJECT_ARG not in out
+    assert out["q"] == 1
+
+
+def test_stamp_project_noop_for_third_party_server():
+    # 第三方 MCP 绝不注入（它们不 strip 该保留参数，注入即污染入参 schema）。
+    token = set_hasn_project_id("proj-7")
+    try:
+        original = {"x": 1}
+        for server in ("qcc", "filesystem", "slack"):
+            out = stamp_project_arg(server, original)
+            assert out is original
+            assert RESERVED_PROJECT_ARG not in out
+    finally:
+        reset_hasn_project_id(token)
+
+
+def test_stamp_project_tolerates_non_mapping_args():
+    token = set_hasn_project_id("p1")
+    try:
+        assert stamp_project_arg("hasn", None) is None
+        assert stamp_project_arg("hasn", "raw") == "raw"
+    finally:
+        reset_hasn_project_id(token)
+
+
+def test_session_and_project_stamps_chain_independently():
+    # 两条轨链式调用（mcp_tool.py 里 session 先、project 后），各写各的键、互不干扰。
+    s_token = set_hasn_session_id("sess-9")
+    p_token = set_hasn_project_id("proj-9")
+    try:
+        args = {"body": "内容"}
+        args = stamp_session_arg("hasn", args)
+        args = stamp_project_arg("hasn", args)
+        assert args[RESERVED_SESSION_ARG] == "sess-9"
+        assert args[RESERVED_PROJECT_ARG] == "proj-9"
+        assert args["body"] == "内容"
+    finally:
+        reset_hasn_project_id(p_token)
+        reset_hasn_session_id(s_token)
+
+
+def test_project_stamp_alone_when_no_session():
+    # 会话轨为空、项目轨有值：project 键在、session 键被 strip（若 LLM 误填）。
+    p_token = set_hasn_project_id("proj-only")
+    try:
+        args = {RESERVED_SESSION_ARG: "llm-faked-session"}
+        args = stamp_session_arg("hasn", args)  # 无会话 → strip
+        args = stamp_project_arg("hasn", args)  # 有项目 → 注入
+        assert RESERVED_SESSION_ARG not in args
+        assert args[RESERVED_PROJECT_ARG] == "proj-only"
+    finally:
+        reset_hasn_project_id(p_token)
