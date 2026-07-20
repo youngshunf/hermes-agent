@@ -1715,6 +1715,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_complete_callback=None,
         gateway_session_key: Optional[str] = None,
         route: Optional[Dict[str, Any]] = None,
+        enabled_toolsets_override: Optional[List[str]] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -1735,6 +1736,9 @@ class APIServerAdapter(BasePlatformAdapter):
         routing).  When set — and no session ``/model`` override exists for
         this session — its model/provider/api_key/base_url override the
         global defaults for this agent instance only.
+
+        ``enabled_toolsets_override`` 是单次 run 的工具集硬覆盖；``None``
+        保持平台配置，空列表则明确禁用所有工具。
         """
         from run_agent import AIAgent
         from gateway.run import (
@@ -1808,7 +1812,11 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         user_config = _load_gateway_config()
-        enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
+        enabled_toolsets = (
+            sorted(_get_platform_tools(user_config, "api_server"))
+            if enabled_toolsets_override is None
+            else list(enabled_toolsets_override)
+        )
 
         max_iterations = _current_max_iterations()
 
@@ -4792,6 +4800,19 @@ class APIServerAdapter(BasePlatformAdapter):
         if not user_message:
             return web.json_response(_openai_error("No user message found in input"), status=400)
 
+        tool_execution = body.get("tool_execution", "enabled")
+        if not isinstance(tool_execution, str) or tool_execution not in {
+            "enabled",
+            "disabled",
+        }:
+            return web.json_response(
+                _openai_error(
+                    "'tool_execution' must be either 'enabled' or 'disabled'"
+                ),
+                status=400,
+            )
+        enabled_toolsets_override = [] if tool_execution == "disabled" else None
+
         instructions = body.get("instructions")
         # HASN 对话派发契约（hasn-node HermesAgentRuntimeAdapter）：对话路径把
         # daemon prompt_assembly 组装的会话稳定片段（IdentityPeer「当前对话对象
@@ -4949,6 +4970,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         tool_progress_callback=event_cb,
                         gateway_session_key=gateway_session_key,
                         route=route,
+                        enabled_toolsets_override=enabled_toolsets_override,
                     )
                 self._active_run_agents[run_id] = agent
 
