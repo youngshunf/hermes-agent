@@ -95,6 +95,79 @@ from gateway.readiness import collect_runtime_readiness
 logger = logging.getLogger(__name__)
 
 
+def _hasn_session_wire_tool_names(
+    allowed_tool_names: tuple[str, ...],
+) -> frozenset[str]:
+    """把 canonical 会话白名单投影成 Hermes MCP wire 工具名集合。"""
+    from gateway.hasn_session import (
+        HASN_CLOUD_MCP_SERVER,
+        HASN_LOCAL_MCP_SERVER,
+    )
+    from tools.mcp_tool import mcp_prefixed_tool_name
+
+    wire_names = {
+        mcp_prefixed_tool_name(HASN_LOCAL_MCP_SERVER, name)
+        for name in allowed_tool_names
+    }
+    wire_names.update(
+        mcp_prefixed_tool_name(HASN_CLOUD_MCP_SERVER, name)
+        for name in allowed_tool_names
+    )
+    wire_names.update(
+        {
+            mcp_prefixed_tool_name(
+                HASN_LOCAL_MCP_SERVER,
+                "hasn.local.tool.search",
+            ),
+            mcp_prefixed_tool_name(
+                HASN_LOCAL_MCP_SERVER,
+                "hasn.local.tool.call",
+            ),
+            mcp_prefixed_tool_name(
+                HASN_LOCAL_MCP_SERVER,
+                "hasn.tool.search",
+            ),
+            mcp_prefixed_tool_name(
+                HASN_CLOUD_MCP_SERVER,
+                "hasn.cloud.tool.search",
+            ),
+            mcp_prefixed_tool_name(
+                HASN_CLOUD_MCP_SERVER,
+                "hasn.cloud.tool.call",
+            ),
+        }
+    )
+    return frozenset(wire_names)
+
+
+def restrict_agent_tools_for_hasn_session(
+    agent: Any,
+    allowed_tool_names: Optional[tuple[str, ...]],
+) -> None:
+    """把 Agent 工具面收敛到会话允许的唤星工具，并保存动态刷新硬门。"""
+    if allowed_tool_names is None:
+        return
+
+    wire_allowlist = _hasn_session_wire_tool_names(allowed_tool_names)
+    filtered_tools = [
+        tool
+        for tool in (getattr(agent, "tools", None) or [])
+        if isinstance(tool, dict)
+        and tool.get("function", {}).get("name") in wire_allowlist
+    ]
+    visible_names = {
+        tool["function"]["name"]
+        for tool in filtered_tools
+    }
+    agent.tools = filtered_tools
+    agent.valid_tool_names = visible_names
+    # tools.mcp_tool.refresh_agent_mcp_tools 会在每轮间读取此属性并再次应用，
+    # 防止晚连接的 MCP 或 /reload-mcp 把受限会话不该见的工具重新发布回来。
+    agent._session_tool_name_allowlist = wire_allowlist
+    if hasattr(agent, "_cached_system_prompt"):
+        agent._cached_system_prompt = None
+
+
 def _hermes_version() -> str:
     """Return the hermes-agent version string, or "dev" if it can't be resolved.
 
@@ -1719,6 +1792,7 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key: Optional[str] = None,
         route: Optional[Dict[str, Any]] = None,
         enabled_toolsets_override: Optional[List[str]] = None,
+        allowed_tool_names: Optional[tuple[str, ...]] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -1742,6 +1816,9 @@ class APIServerAdapter(BasePlatformAdapter):
 
         ``enabled_toolsets_override`` 是单次 run 的工具集硬覆盖；``None``
         保持平台配置，空列表则明确禁用所有工具。
+
+        ``allowed_tool_names`` 是工作会话级 canonical 工具白名单；``None`` 保持
+        旧会话不限制，空 tuple 则只保留渐进式暴露传输壳。
         """
         from run_agent import AIAgent
         from gateway.run import (
@@ -1846,6 +1923,7 @@ class APIServerAdapter(BasePlatformAdapter):
             reasoning_config=reasoning_config,
             gateway_session_key=gateway_session_key,
         )
+        restrict_agent_tools_for_hasn_session(agent, allowed_tool_names)
         return agent
 
     # ------------------------------------------------------------------
@@ -4847,6 +4925,23 @@ class APIServerAdapter(BasePlatformAdapter):
             )
         enabled_toolsets_override = [] if tool_execution == "disabled" else None
 
+        allowed_tool_names = None
+        if "allowed_tool_names" in body:
+            from gateway.hasn_session import parse_allowed_tool_names
+
+            try:
+                allowed_tool_names = parse_allowed_tool_names(
+                    body["allowed_tool_names"]
+                )
+            except ValueError as exc:
+                return web.json_response(
+                    _openai_error(
+                        str(exc),
+                        code="invalid_allowed_tool_names",
+                    ),
+                    status=400,
+                )
+
         dispatch_id = body.get("dispatch_id")
         dispatch_fingerprint = None
         if dispatch_id is not None:
@@ -5061,6 +5156,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         gateway_session_key=gateway_session_key,
                         route=route,
                         enabled_toolsets_override=enabled_toolsets_override,
+                        allowed_tool_names=allowed_tool_names,
                     )
                 self._active_run_agents[run_id] = agent
 
@@ -5095,8 +5191,10 @@ class APIServerAdapter(BasePlatformAdapter):
 
                 def _run_sync():
                     from gateway.hasn_session import (
+                        reset_hasn_allowed_tool_names,
                         reset_hasn_project_id,
                         reset_hasn_session_id,
+                        set_hasn_allowed_tool_names,
                         set_hasn_project_id,
                         set_hasn_session_id,
                     )
@@ -5123,6 +5221,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     # ``project_id`` ⇒ None（不绑、不注入，零影响面）。
                     hasn_project_token = None
                     daemon_project_id = body.get("project_id")
+                    # IMG3 P3.4：把 daemon 透传的精确工具白名单绑定到本 run 线程，
+                    # MCP handler 在模型输出后据此做最终目标判权并向下游可信盖章。
+                    hasn_allowed_tools_token = None
                     with self._profile_scope(request_profile):
                         try:
                             # Bind approval/session identity for this API run via
@@ -5136,6 +5237,9 @@ class APIServerAdapter(BasePlatformAdapter):
                                 hasn_session_token = set_hasn_session_id(daemon_session_id)
                             if daemon_project_id:
                                 hasn_project_token = set_hasn_project_id(daemon_project_id)
+                            hasn_allowed_tools_token = set_hasn_allowed_tool_names(
+                                allowed_tool_names
+                            )
                             register_gateway_notify(approval_session_key, _approval_notify)
                             r = agent.run_conversation(
                                 user_message=user_message,
@@ -5143,6 +5247,13 @@ class APIServerAdapter(BasePlatformAdapter):
                                 task_id=effective_task_id,
                             )
                         finally:
+                            if hasn_allowed_tools_token is not None:
+                                try:
+                                    reset_hasn_allowed_tool_names(
+                                        hasn_allowed_tools_token
+                                    )
+                                except Exception:
+                                    pass
                             if hasn_project_token is not None:
                                 try:
                                     reset_hasn_project_id(hasn_project_token)

@@ -29,8 +29,9 @@ per-(owner,agent) 会话无关）时采纳它作为本次调用的会话身份�
 
 from __future__ import annotations
 
+import re
 from contextvars import ContextVar, Token
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping, Optional, Sequence
 
 # 与 hasn-mcp（Rust）auth.rs::RESERVED_SESSION_ARG 严格一致。
 RESERVED_SESSION_ARG = "_hasn_session_id"
@@ -39,6 +40,11 @@ RESERVED_SESSION_ARG = "_hasn_session_id"
 # 严格一致（PJ U5b）。本次派发所属的平台项目 id，随会话身份一同系统注入，供云端
 # register-on-write 把产出资源打到项目名下；分身（LLM）不允许、也不需要自己填。
 RESERVED_PROJECT_ARG = "_hasn_project_id"
+
+# 与 hasn-mcp（Rust）auth.rs::RESERVED_ALLOWED_TOOL_NAMES_ARG 及云端
+# trust_gate.py::RESERVED_ALLOWED_TOOL_NAMES 严格一致。它承载本次工作会话可调用的
+# canonical 工具名；由 Runtime 在模型输出后覆盖式注入，分身不可自填。
+RESERVED_ALLOWED_TOOL_NAMES_ARG = "_hasn_allowed_tool_names"
 
 # 本地 daemon MCP 服务在 Hermes 配置里的固定名字（见 huanxing_hermes_runtime
 # profile_config.py：``mcp_servers["hasn"]``）。
@@ -53,6 +59,19 @@ HASN_CLOUD_MCP_SERVER = "cloud"
 # 会被系统打标 ``_hasn_session_id`` 的唤星自有 MCP 服务全集（server 侧都会 strip）。
 HASN_STAMPED_MCP_SERVERS = frozenset({HASN_LOCAL_MCP_SERVER, HASN_CLOUD_MCP_SERVER})
 
+# 受限会话仍需保留的渐进式暴露传输壳；真正业务目标会在本地/云端 wrapper 内再次判权。
+HASN_SESSION_TRANSPORT_TOOLS = frozenset(
+    {
+        "hasn.local.tool.search",
+        "hasn.local.tool.call",
+        "hasn.cloud.tool.search",
+        "hasn.cloud.tool.call",
+        "hasn.tool.search",
+    }
+)
+
+_CANONICAL_TOOL_NAME = re.compile(r"^hasn(?:\.[A-Za-z0-9_-]+)+$")
+
 # 任务局部的当前 run 会话 id（daemon 透传的 ``session_id``）。并发会话互不串扰。
 _HASN_SESSION_ID: "ContextVar[Optional[str]]" = ContextVar(
     "HUANXING_HASN_SESSION_ID", default=None
@@ -63,6 +82,93 @@ _HASN_SESSION_ID: "ContextVar[Optional[str]]" = ContextVar(
 _HASN_PROJECT_ID: "ContextVar[Optional[str]]" = ContextVar(
     "HUANXING_HASN_PROJECT_ID", default=None
 )
+
+# 任务局部的当前 run 精确工具白名单。``None`` 表示兼容旧调用、不限制；空 tuple
+# 表示明确拒绝全部业务工具。保留 tuple 是为了原样传到下游，不打乱调用方声明顺序。
+_HASN_ALLOWED_TOOL_NAMES: "ContextVar[Optional[tuple[str, ...]]]" = ContextVar(
+    "HUANXING_HASN_ALLOWED_TOOL_NAMES", default=None
+)
+
+
+def parse_allowed_tool_names(raw: Any) -> tuple[str, ...]:
+    """严格解析工作会话工具白名单，保持原始顺序并拒绝重复项。
+
+    只接受 canonical 工具名字符串数组；字段缺失与 ``None`` 的兼容语义由 API
+    调用方处理，传到这里的值必须是数组。
+    """
+    if not isinstance(raw, list):
+        raise ValueError("allowed_tool_names must be an array")
+    names: list[str] = []
+    seen: set[str] = set()
+    for value in raw:
+        if not isinstance(value, str) or not _CANONICAL_TOOL_NAME.fullmatch(value):
+            raise ValueError("allowed_tool_names contains a non-canonical tool name")
+        if value in seen:
+            raise ValueError(f"allowed_tool_names contains duplicate tool name: {value}")
+        seen.add(value)
+        names.append(value)
+    return tuple(names)
+
+
+def set_hasn_allowed_tool_names(
+    allowed_tool_names: Optional[Sequence[str]],
+) -> Token:
+    """绑定当前 run 的精确工具白名单，返回供 ``finally`` 复原的 token。"""
+    normalized = (
+        tuple(allowed_tool_names) if allowed_tool_names is not None else None
+    )
+    return _HASN_ALLOWED_TOOL_NAMES.set(normalized)
+
+
+def reset_hasn_allowed_tool_names(token: Token) -> None:
+    """复原当前 run 的工具白名单绑定。"""
+    _HASN_ALLOWED_TOOL_NAMES.reset(token)
+
+
+def get_hasn_allowed_tool_names() -> Optional[tuple[str, ...]]:
+    """读取当前 run 的工具白名单；``None`` 表示旧会话不限制。"""
+    return _HASN_ALLOWED_TOOL_NAMES.get()
+
+
+def is_hasn_tool_allowed(server_name: str, tool_name: str) -> bool:
+    """判断当前 run 是否允许执行指定 MCP 目标。
+
+    受限会话只允许唤星自有服务上的传输壳与白名单业务工具；第三方 MCP 和
+    Hermes 内置工具均不在此通道放行。
+    """
+    allowed_tool_names = get_hasn_allowed_tool_names()
+    if allowed_tool_names is None:
+        return True
+    if server_name not in HASN_STAMPED_MCP_SERVERS:
+        return False
+    return (
+        tool_name in HASN_SESSION_TRANSPORT_TOOLS
+        or tool_name in allowed_tool_names
+    )
+
+
+def stamp_allowed_tool_names_arg(server_name: str, args: Any) -> Any:
+    """把当前 run 的精确工具白名单盖章到唤星自有 MCP 调用。
+
+    有白名单时覆盖模型同名入参；无白名单时剥离模型伪造值；第三方服务原样返回。
+    """
+    if server_name not in HASN_STAMPED_MCP_SERVERS:
+        return args
+    if not isinstance(args, Mapping):
+        return args
+    allowed_tool_names = get_hasn_allowed_tool_names()
+    if allowed_tool_names is not None:
+        return {
+            **args,
+            RESERVED_ALLOWED_TOOL_NAMES_ARG: list(allowed_tool_names),
+        }
+    if RESERVED_ALLOWED_TOOL_NAMES_ARG in args:
+        return {
+            key: value
+            for key, value in args.items()
+            if key != RESERVED_ALLOWED_TOOL_NAMES_ARG
+        }
+    return args
 
 
 def set_hasn_session_id(session_id: Optional[str]) -> Token:

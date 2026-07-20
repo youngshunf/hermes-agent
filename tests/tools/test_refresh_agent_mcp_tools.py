@@ -183,6 +183,19 @@ def test_refreshed_tool_is_callable_through_valid_tool_names_guard(monkeypatch):
     assert any(t["function"]["name"] == "mcp_granola_list_meetings" for t in agent.tools)
 
 
+def test_restricted_hasn_session_does_not_republish_unlisted_tools():
+    """受限唤星会话在真实 registry 刷新后仍只能看到 wire 白名单。"""
+    agent = _agent(["terminal"])
+    agent._session_tool_name_allowlist = frozenset(
+        {"mcp__hasn__hasn_session_ask"}
+    )
+
+    mcp_tool.refresh_agent_mcp_tools(agent)
+
+    assert agent.valid_tool_names <= agent._session_tool_name_allowlist
+    assert "terminal" not in agent.valid_tool_names
+
+
 def test_refresh_is_thread_safe_under_concurrent_calls(monkeypatch):
     """Concurrent refreshes keep tools / valid_tool_names coherent.
 

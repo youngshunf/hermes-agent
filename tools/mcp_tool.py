@@ -125,6 +125,17 @@ try:
 except Exception:  # pragma: no cover - gateway 不可导入的进程（CLI/cron）
     _stamp_hasn_project_arg = None
 
+try:
+    from gateway.hasn_session import (
+        get_hasn_allowed_tool_names as _get_hasn_allowed_tool_names,
+        is_hasn_tool_allowed as _is_hasn_tool_allowed,
+        stamp_allowed_tool_names_arg as _stamp_hasn_allowed_tool_names_arg,
+    )
+except Exception:  # pragma: no cover - gateway 不可导入的进程（CLI/cron）
+    _get_hasn_allowed_tool_names = None
+    _is_hasn_tool_allowed = None
+    _stamp_hasn_allowed_tool_names_arg = None
+
 # Upper bound for the OSV malware preflight during stdio MCP startup. The
 # check makes a blocking urllib HTTPS call whose own timeout can fail to
 # interrupt a stalled SSL handshake, which froze the asyncio event loop and
@@ -4076,6 +4087,25 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     """
 
     def _handler(args: dict, **kwargs) -> str:
+        # 会话级硬门必须先于连接查找和网络调用：受限 run 只允许传输壳与精确
+        # 白名单业务目标，第三方 MCP 同样失败关闭。
+        restricted_session = (
+            _get_hasn_allowed_tool_names is not None
+            and _get_hasn_allowed_tool_names() is not None
+        )
+        if restricted_session and (
+            _is_hasn_tool_allowed is None
+            or not _is_hasn_tool_allowed(server_name, tool_name)
+        ):
+            return json.dumps(
+                {
+                    "code": "MCP_9206",
+                    "error": "ToolNotAllowed",
+                    "tool_name": tool_name,
+                },
+                ensure_ascii=False,
+            )
+
         # 唤星补丁：出站到唤星 hasn MCP 服务器的工具调用注入 _hasn_session_id，
         # 让云端 ask 卡片能把提问回绑到发起会话（session binding）。失败不阻断调用。
         if _stamp_hasn_session_arg is not None:
@@ -4097,6 +4127,25 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                     "MCP server '%s': stamp _hasn_project_id failed (ignored)",
                     server_name,
                 )
+        # IMG3 P3.4：最后覆盖式注入工作会话精确工具白名单。受限会话若盖章
+        # 异常必须失败关闭，否则下游会把缺字段误判为旧会话不限制。
+        if _stamp_hasn_allowed_tool_names_arg is not None:
+            try:
+                args = _stamp_hasn_allowed_tool_names_arg(server_name, args)
+            except Exception:
+                logger.exception(
+                    "MCP server '%s': stamp _hasn_allowed_tool_names failed",
+                    server_name,
+                )
+                if restricted_session:
+                    return json.dumps(
+                        {
+                            "code": "MCP_9206",
+                            "error": "ToolNotAllowed",
+                            "tool_name": tool_name,
+                        },
+                        ensure_ascii=False,
+                    )
         # Circuit breaker: if this server has failed too many times
         # consecutively, short-circuit with a clear message so the model
         # stops retrying and uses alternative approaches (#10447).
@@ -5665,6 +5714,21 @@ def refresh_agent_mcp_tools(
     # half-swap. ``staged_engine_names`` are the context-engine routing names
     # this rebuild actually appended (matching agent_init's dedup-aware add).
     staged_engine_names = _reinject_post_build_tools(agent, new_defs, new_names)
+
+    # 唤星受限工作会话的工具面不能被晚连接 MCP 或 /reload-mcp 重新扩张。
+    # None 表示普通 Hermes 会话不限制；空集合表示明确不暴露任何 wire 工具。
+    session_tool_allowlist = getattr(agent, "_session_tool_name_allowlist", None)
+    if session_tool_allowlist is not None:
+        new_defs = [
+            tool
+            for tool in new_defs
+            if tool.get("function", {}).get("name") in session_tool_allowlist
+        ]
+        new_names = {
+            tool["function"]["name"]
+            for tool in new_defs
+        }
+        staged_engine_names.intersection_update(new_names)
 
     # Single atomic read-diff-publish so the returned ``added`` is consistent
     # with what was actually published, even under concurrent callers, and a

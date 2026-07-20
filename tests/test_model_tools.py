@@ -19,6 +19,20 @@ from model_tools import (
 # =========================================================================
 
 class TestHandleFunctionCall:
+    def test_session_tool_allowlist_rejects_forged_unlisted_call(self):
+        result = json.loads(
+            handle_function_call(
+                "totally_fake_tool_xyz",
+                {},
+                enabled_tools=[],
+            )
+        )
+        assert result == {
+            "code": "MCP_9206",
+            "error": "ToolNotAllowed",
+            "tool_name": "totally_fake_tool_xyz",
+        }
+
     def test_agent_loop_tool_returns_error(self):
         for tool_name in _AGENT_LOOP_TOOLS:
             result = json.loads(handle_function_call(tool_name, {}))

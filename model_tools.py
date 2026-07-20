@@ -1066,6 +1066,17 @@ def handle_function_call(
     function_args = coerce_tool_args(function_name, function_args)
     if not isinstance(function_args, dict):
         function_args = {}
+    # Agent 工具快照既是模型可见面，也是最终执行白名单。空列表表示明确拒绝
+    # 所有工具，不能再按旧逻辑回落为 process-global registry。
+    if enabled_tools is not None and function_name not in enabled_tools:
+        return json.dumps(
+            {
+                "code": "MCP_9206",
+                "error": "ToolNotAllowed",
+                "tool_name": function_name,
+            },
+            ensure_ascii=False,
+        )
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
 
     # ── Tool Search bridge dispatch ──────────────────────────────────
