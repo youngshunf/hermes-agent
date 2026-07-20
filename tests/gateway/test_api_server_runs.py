@@ -9,6 +9,7 @@ Covers:
 """
 
 import asyncio
+import json
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -237,6 +238,82 @@ class TestStartRun:
             resp = await cli.post(
                 "/v1/runs",
                 json={"input": "hello", "tool_execution": "read_only"},
+            )
+        assert resp.status == 400
+        assert adapter._run_streams == {}
+        assert adapter._run_statuses == {}
+
+    @pytest.mark.asyncio
+    async def test_start_same_dispatch_id_reuses_run_without_duplicate_agent(
+        self, adapter
+    ):
+        """同一稳定派发重复 POST 只能返回原 run，不能再次调用模型。"""
+        app = _create_runs_app(adapter)
+        adapter._max_concurrent_runs = 1
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent, ready, interrupted = _make_slow_agent()
+                mock_create.return_value = mock_agent
+                body = {
+                    "input": "仅汇报结果",
+                    "dispatch_id": "finance_cb_run_1_v1",
+                    "tool_execution": "disabled",
+                }
+
+                first = await cli.post("/v1/runs", json=body)
+                assert ready.wait(timeout=3.0)
+                second = await cli.post("/v1/runs", json=body)
+                assert first.status == 202
+                assert second.status == 202
+                first_data = await first.json()
+                second_data = await second.json()
+                assert first_data["run_id"] == second_data["run_id"]
+                assert first_data["run_id"].startswith("run_d_")
+                assert second_data["status"] == "already_exists"
+
+                interrupted.set()
+                await (await cli.get(
+                    f"/v1/runs/{first_data['run_id']}/events"
+                )).text()
+                mock_create.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_start_same_dispatch_id_with_changed_payload_returns_409(
+        self, adapter
+    ):
+        """幂等键复用但正文漂移必须显式冲突，不能误认成同一次派发。"""
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent, ready, interrupted = _make_slow_agent()
+                mock_create.return_value = mock_agent
+                first = await cli.post(
+                    "/v1/runs",
+                    json={"input": "原始正文", "dispatch_id": "dispatch_same"},
+                )
+                assert first.status == 202
+                assert ready.wait(timeout=3.0)
+
+                conflict = await cli.post(
+                    "/v1/runs",
+                    json={"input": "被篡改正文", "dispatch_id": "dispatch_same"},
+                )
+                assert conflict.status == 409
+                data = await conflict.json()
+                assert data["error"]["code"] == "idempotency_conflict"
+                mock_create.assert_called_once()
+                interrupted.set()
+
+    @pytest.mark.asyncio
+    async def test_start_invalid_dispatch_id_returns_400_before_allocating_run(
+        self, adapter
+    ):
+        """派发幂等键只接受受限 ASCII，避免路由、日志和内存键污染。"""
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/runs",
+                json={"input": "hello", "dispatch_id": "含 空格"},
             )
         assert resp.status == 400
         assert adapter._run_streams == {}
@@ -572,6 +649,59 @@ class TestRunEvents:
                 assert "run.completed" in body
                 assert "Hello!" in body
 
+    @pytest.mark.asyncio
+    async def test_events_replays_terminal_status_after_transport_was_removed(
+        self, adapter
+    ):
+        """客户端丢失原 SSE 后，终态必须能从保留状态确定性重放。"""
+        app = _create_runs_app(adapter)
+        run_id = "run_d_terminal_replay"
+        adapter._set_run_status(
+            run_id,
+            "completed",
+            output="已完成",
+            usage={"input_tokens": 1, "output_tokens": 2, "total_tokens": 3},
+            last_event="run.completed",
+        )
+
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.get(f"/v1/runs/{run_id}/events")
+            assert response.status == 200
+            body = await response.text()
+
+        assert "run.completed" in body
+        data_line = next(line for line in body.splitlines() if line.startswith("data: "))
+        assert json.loads(data_line.removeprefix("data: "))["output"] == "已完成"
+
+    @pytest.mark.asyncio
+    async def test_events_reconnects_to_active_run_after_transport_was_removed(
+        self, adapter
+    ):
+        """活跃 run 的新订阅必须接管后续终态，不能因旧队列丢失而永久 404。"""
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent, ready, interrupted = _make_slow_agent()
+                mock_create.return_value = mock_agent
+                started = await cli.post(
+                    "/v1/runs",
+                    json={"input": "hello", "dispatch_id": "dispatch_reconnect"},
+                )
+                run_id = (await started.json())["run_id"]
+                assert ready.wait(timeout=3.0)
+                adapter._run_streams.pop(run_id)
+                adapter._run_streams_created.pop(run_id)
+
+                events_task = asyncio.create_task(
+                    cli.get(f"/v1/runs/{run_id}/events")
+                )
+                await asyncio.sleep(0)
+                interrupted.set()
+                response = await asyncio.wait_for(events_task, timeout=5.0)
+                assert response.status == 200
+                body = await asyncio.wait_for(response.text(), timeout=5.0)
+
+        assert "run.completed" in body
 
 
     @pytest.mark.asyncio

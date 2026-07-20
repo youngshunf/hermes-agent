@@ -985,6 +985,9 @@ class APIServerAdapter(BasePlatformAdapter):
         self._stopping_run_ids: set[str] = set()
         # Pollable run status for dashboards and external control-plane UIs.
         self._run_statuses: Dict[str, Dict[str, Any]] = {}
+        # 稳定 dispatch_id 对应请求正文的指纹。与终态 status 同寿命，用于区分合法重放
+        # 与“同一幂等键、不同正文”的调用方错误；原始正文和密钥都不落入状态响应。
+        self._run_dispatch_fingerprints: Dict[str, str] = {}
         # Active approval session key for each run_id.  The approval core
         # resolves requests by session key, while API clients address the
         # in-flight run by run_id.
@@ -1996,6 +1999,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_submission": True,
                 "run_status": True,
                 "run_events_sse": True,
+                "tool_execution_disabled_v1": True,
+                "dispatch_idempotency_v1": True,
+                "run_terminal_replay_v1": True,
                 "run_stop": True,
                 "run_approval_response": True,
                 "tool_progress_events": True,
@@ -4714,6 +4720,35 @@ class APIServerAdapter(BasePlatformAdapter):
         self._run_statuses[run_id] = current
         return current
 
+    @staticmethod
+    def _terminal_run_event(status: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """从保留的权威终态重建一条可重放 SSE 事件。"""
+        run_id = status.get("run_id")
+        state = status.get("status")
+        timestamp = status.get("updated_at", time.time())
+        if state == "completed":
+            return {
+                "event": "run.completed",
+                "run_id": run_id,
+                "timestamp": timestamp,
+                "output": status.get("output", ""),
+                "usage": status.get("usage", {}),
+            }
+        if state == "failed":
+            return {
+                "event": "run.failed",
+                "run_id": run_id,
+                "timestamp": timestamp,
+                "error": status.get("error", "agent run failed"),
+            }
+        if state == "cancelled":
+            return {
+                "event": "run.cancelled",
+                "run_id": run_id,
+                "timestamp": timestamp,
+            }
+        return None
+
     def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
         """Return a tool_progress_callback that pushes structured events to the run's SSE queue."""
         def _push(event: Dict[str, Any]) -> None:
@@ -4777,16 +4812,15 @@ class APIServerAdapter(BasePlatformAdapter):
         if key_err is not None:
             return key_err
 
-        # Enforce concurrency limit (shared across all agent-serving
-        # endpoints; configurable via gateway.api_server.max_concurrent_runs).
-        limited = self._concurrency_limited_response()
-        if limited is not None:
-            return limited
-
         try:
             body = await request.json()
         except Exception:
             return web.json_response(_openai_error("Invalid JSON"), status=400)
+        if not isinstance(body, dict):
+            return web.json_response(
+                _openai_error("JSON body must be an object"),
+                status=400,
+            )
 
         # 契约事实（与 hasn-node adapter hermes.rs payload 构造处注释互认，事实源：
         # 父仓 docs/hasn-node设计文档/04-Runtime接入/14-runs传输契约与消息投递可靠性）：
@@ -4812,6 +4846,30 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=400,
             )
         enabled_toolsets_override = [] if tool_execution == "disabled" else None
+
+        dispatch_id = body.get("dispatch_id")
+        dispatch_fingerprint = None
+        if dispatch_id is not None:
+            if not isinstance(dispatch_id, str) or not re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}",
+                dispatch_id,
+            ):
+                return web.json_response(
+                    _openai_error(
+                        "'dispatch_id' must be 1-128 ASCII letters, digits, '.', '_' or '-'",
+                        code="invalid_dispatch_id",
+                    ),
+                    status=400,
+                )
+            canonical_body = json.dumps(
+                body,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            dispatch_fingerprint = hashlib.sha256(
+                canonical_body.encode("utf-8")
+            ).hexdigest()
 
         instructions = body.get("instructions")
         # HASN 对话派发契约（hasn-node HermesAgentRuntimeAdapter）：对话路径把
@@ -4874,7 +4932,38 @@ class APIServerAdapter(BasePlatformAdapter):
                         )
                     conversation_history.append({"role": msg["role"], "content": str(content)})
 
-        run_id = f"run_{uuid.uuid4().hex}"
+        run_id = (
+            f"run_d_{hashlib.sha256(dispatch_id.encode('utf-8')).hexdigest()[:32]}"
+            if dispatch_id is not None
+            else f"run_{uuid.uuid4().hex}"
+        )
+        if dispatch_id is not None:
+            existing = self._run_statuses.get(run_id)
+            if existing is not None:
+                if self._run_dispatch_fingerprints.get(run_id) != dispatch_fingerprint:
+                    return web.json_response(
+                        _openai_error(
+                            "dispatch_id already belongs to a different request",
+                            code="idempotency_conflict",
+                        ),
+                        status=409,
+                    )
+                return web.json_response(
+                    {
+                        "run_id": run_id,
+                        "status": "already_exists",
+                        "run_status": existing.get("status", "queued"),
+                    },
+                    status=202,
+                )
+            self._run_dispatch_fingerprints[run_id] = dispatch_fingerprint
+        # 只对真正的新 run 执行并发准入；同幂等键重放只是读取既有状态，不应在原 run
+        # 占满配额时被 429 挡住。
+        limited = self._concurrency_limited_response()
+        if limited is not None:
+            if dispatch_id is not None:
+                self._run_dispatch_fingerprints.pop(run_id, None)
+            return limited
         session_id = body.get("session_id") or stored_session_id or run_id
         # 策略 A（会话连续性）：调用方（hasn-node daemon）只送稳定 session_id，由本
         # 服务按 session_id 自管历史。当 body 未显式带 conversation_history 且 session_id
@@ -4913,9 +5002,10 @@ class APIServerAdapter(BasePlatformAdapter):
         event_cb = self._make_run_event_callback(run_id, loop)
 
         def _put_event_if_active(event: Optional[Dict]) -> None:
-            """Enqueue only while this run still owns live transport state."""
-            if self._run_streams.get(run_id) is q:
-                q.put_nowait(event)
+            """写入当前订阅队列；断线重连后自动切换到新 transport。"""
+            active_queue = self._run_streams.get(run_id)
+            if active_queue is not None:
+                active_queue.put_nowait(event)
 
         # Also wire stream_delta_callback so message.delta events flow through.
         def _text_cb(delta: Optional[str]) -> None:
@@ -4999,7 +5089,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         last_event="approval.request",
                     )
                     try:
-                        loop.call_soon_threadsafe(q.put_nowait, event)
+                        loop.call_soon_threadsafe(_put_event_if_active, event)
                     except Exception:
                         pass
 
@@ -5240,9 +5330,20 @@ class APIServerAdapter(BasePlatformAdapter):
 
         run_id = request.match_info["run_id"]
 
-        # Allow subscribing slightly before the run is registered (race condition window)
+        # Allow subscribing slightly before the run is registered (race condition window).
+        # 原 transport 丢失时按权威 status 重建：活跃 run 接管后续事件，终态 run 立即重放。
         for _ in range(20):
             if run_id in self._run_streams:
+                break
+            status = self._run_statuses.get(run_id)
+            if status is not None:
+                q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue()
+                self._run_streams[run_id] = q
+                self._run_streams_created[run_id] = time.time()
+                terminal_event = self._terminal_run_event(status)
+                if terminal_event is not None:
+                    q.put_nowait(terminal_event)
+                    q.put_nowait(None)
                 break
             await asyncio.sleep(0.05)
         else:
@@ -5278,8 +5379,9 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.debug("[api_server] SSE stream error for run %s: %s", run_id, exc)
         finally:
             self._run_stream_subscribers.discard(run_id)
-            self._run_streams.pop(run_id, None)
-            self._run_streams_created.pop(run_id, None)
+            if self._run_streams.get(run_id) is q:
+                self._run_streams.pop(run_id, None)
+                self._run_streams_created.pop(run_id, None)
 
         return response
 
@@ -5443,6 +5545,7 @@ class APIServerAdapter(BasePlatformAdapter):
         ]
         for run_id in stale_statuses:
             self._run_statuses.pop(run_id, None)
+            self._run_dispatch_fingerprints.pop(run_id, None)
 
     # ------------------------------------------------------------------
     # BasePlatformAdapter interface
