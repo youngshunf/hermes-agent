@@ -780,13 +780,15 @@ class TestRunEvents:
 
     async def _run_and_capture_hasn_session(self, adapter, cli, body):
         """跑一个 run，回收 run_conversation 执行线程里看到的 _hasn_session_id。"""
-        from gateway.hasn_session import get_hasn_session_id
+        from gateway.hasn_session import get_hasn_session_id, get_hasn_work_session_id
 
         seen = {}
 
         def _capture(**_kwargs):
             # 分身真正干活的线程——本地 hasn MCP 工具就是在这里读会话戳的
             seen["session_id"] = get_hasn_session_id()
+            # 会话轴分流（设计 02 §4.3）：工作会话轨同点回收，两轨互不串扰才成立。
+            seen["work_session_id"] = get_hasn_work_session_id()
             return {"final_response": "ok"}
 
         with patch.object(adapter, "_create_agent") as mock_create:
@@ -845,6 +847,64 @@ class TestRunEvents:
         async with TestClient(TestServer(app)) as cli:
             await self._run_and_capture_hasn_session(
                 adapter, cli, {"input": "hi", "session_id": "conv_reset_me"}
+            )
+        assert len(resets) == 1
+
+    @pytest.mark.asyncio
+    async def test_hasn_work_session_id_bound_to_run_thread(self, adapter):
+        """会话轴分流（设计 02 §4.3）：daemon 透传的 work_session_id 必须绑到 run 的
+        执行线程，与 session_id（运行时轴）分轨共存。
+
+        断链后果：工作会话派发的工具调用盖不上 _hasn_work_session_id，云端产物
+        落不进工作会话列——主人在会话资源栏看不到分身刚干的活。
+        """
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            seen = await self._run_and_capture_hasn_session(
+                adapter,
+                cli,
+                {
+                    "input": "hi",
+                    "session_id": "rt_conv_1",
+                    "work_session_id": "ws_task_1",
+                },
+            )
+        # 两轨分立：runtime 值落 session 轨、工作会话值落 work_session 轨。
+        assert seen["session_id"] == "rt_conv_1"
+        assert seen["work_session_id"] == "ws_task_1"
+
+    @pytest.mark.asyncio
+    async def test_hasn_work_session_id_not_bound_for_im_main_session(self, adapter):
+        """IM 主会话派发形态（body 无 work_session_id）：工作会话轨必须保持 None——
+        否则 stamp 会把主会话产物错误盖进某个工作会话资源栏。"""
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            seen = await self._run_and_capture_hasn_session(
+                adapter, cli, {"input": "hi", "session_id": "rt_conv_main"}
+            )
+        assert seen["session_id"] == "rt_conv_main"
+        assert seen["work_session_id"] is None
+
+    @pytest.mark.asyncio
+    async def test_hasn_work_session_id_reset_after_run(self, adapter, monkeypatch):
+        """工作会话轨同样必须 finally reset——线程池复用线程，不 reset 会把上一个
+        工作会话的戳串给下一个 run（主会话产物被错挂进旧工作会话资源栏）。"""
+        import gateway.hasn_session as hasn_session
+
+        resets = []
+        real_reset = hasn_session.reset_hasn_work_session_id
+        monkeypatch.setattr(
+            hasn_session,
+            "reset_hasn_work_session_id",
+            lambda token: (resets.append(token), real_reset(token))[1],
+        )
+
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            await self._run_and_capture_hasn_session(
+                adapter,
+                cli,
+                {"input": "hi", "work_session_id": "ws_reset_me"},
             )
         assert len(resets) == 1
 

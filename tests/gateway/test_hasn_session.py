@@ -1,11 +1,13 @@
-"""唤星会话绑定载体（提问卡修复）+ 项目绑定载体（PJ U5b）单测。
+"""唤星会话绑定载体（提问卡修复）+ 工作会话轨（设计 02 §4.3）+ 项目绑定载体（PJ U5b）单测。
 
 覆盖 ``gateway.hasn_session``：
-- ``set/get/reset`` ContextVar 任务局部、空值归一（会话与项目两条轨各一套）；
-- ``stamp_session_arg`` / ``stamp_project_arg`` 纯函数：对唤星自有服务（``hasn`` 本地 +
-  ``cloud`` 云端平台工具）打标、覆盖式注入、无值时 strip 掉 LLM 误填的保留参数、第三方
-  服务原样、不修改入参；
-- 两条轨链式调用互不干扰（各增删自己的保留键）。
+- ``set/get/reset`` ContextVar 任务局部、空值归一（会话、工作会话、项目三条轨各一套）；
+- ``stamp_session_arg`` / ``stamp_work_session_arg`` / ``stamp_project_arg`` 纯函数：
+  对唤星自有服务（``hasn`` 本地 + ``cloud`` 云端平台工具）打标、覆盖式注入、无值时
+  strip 掉 LLM 误填的保留参数、第三方服务原样、不修改入参；
+- 三条轨链式调用互不干扰（各增删自己的保留键）；
+- 会话轴分流契约：``_hasn_session_id`` 恒为运行时/逻辑会话语义，
+  ``_hasn_work_session_id`` 仅真实工作会话派发非空，IM 主会话派发被 strip。
 """
 
 import pytest
@@ -16,14 +18,19 @@ from gateway.hasn_session import (
     HASN_STAMPED_MCP_SERVERS,
     RESERVED_PROJECT_ARG,
     RESERVED_SESSION_ARG,
+    RESERVED_WORK_SESSION_ARG,
     get_hasn_project_id,
     get_hasn_session_id,
+    get_hasn_work_session_id,
     reset_hasn_project_id,
     reset_hasn_session_id,
+    reset_hasn_work_session_id,
     set_hasn_project_id,
     set_hasn_session_id,
+    set_hasn_work_session_id,
     stamp_project_arg,
     stamp_session_arg,
+    stamp_work_session_arg,
 )
 
 
@@ -235,3 +242,114 @@ def test_project_stamp_alone_when_no_session():
         assert args[RESERVED_PROJECT_ARG] == "proj-only"
     finally:
         reset_hasn_project_id(p_token)
+
+
+# ── 工作会话轨（设计 02 §4.3 会话轴分流）────────────────────────────────────
+
+
+def test_work_session_reserved_arg_matches_rust_and_cloud_contract():
+    # 与 hasn-mcp(Rust) auth.rs::RESERVED_WORK_SESSION_ARG + 云端
+    # trust_gate.py::RESERVED_WORK_SESSION_ID 逐字一致——错一个字符整条产物登记链静默断。
+    assert RESERVED_WORK_SESSION_ARG == "_hasn_work_session_id"
+
+
+def test_work_session_set_get_reset_roundtrip():
+    assert get_hasn_work_session_id() is None
+    token = set_hasn_work_session_id("ws-1")
+    assert get_hasn_work_session_id() == "ws-1"
+    reset_hasn_work_session_id(token)
+    assert get_hasn_work_session_id() is None
+
+
+def test_blank_work_session_id_normalizes_to_none():
+    token = set_hasn_work_session_id("   ")
+    try:
+        assert get_hasn_work_session_id() is None
+    finally:
+        reset_hasn_work_session_id(token)
+
+
+def test_stamp_injects_work_session_id_for_hasn_and_cloud():
+    token = set_hasn_work_session_id("ws-7")
+    try:
+        for server in ("hasn", "cloud"):
+            original = {"title": "季度复盘"}
+            out = stamp_work_session_arg(server, original)
+            assert out[RESERVED_WORK_SESSION_ARG] == "ws-7"
+            assert out["title"] == "季度复盘"
+            # 不修改入参（immutable）。
+            assert RESERVED_WORK_SESSION_ARG not in original
+    finally:
+        reset_hasn_work_session_id(token)
+
+
+def test_stamp_overwrites_llm_provided_work_session_id():
+    # 分身不允许自填——系统值覆盖 LLM 值。
+    token = set_hasn_work_session_id("authoritative-ws")
+    try:
+        out = stamp_work_session_arg("hasn", {RESERVED_WORK_SESSION_ARG: "llm-faked"})
+        assert out[RESERVED_WORK_SESSION_ARG] == "authoritative-ws"
+    finally:
+        reset_hasn_work_session_id(token)
+
+
+def test_stamp_strips_llm_injected_work_session_arg_when_no_work_session():
+    # IM 主会话派发（无工作会话绑定）时，绝不让 LLM 误填的保留参数漏到 daemon/云端
+    # 污染工作会话轴。
+    assert get_hasn_work_session_id() is None
+    out = stamp_work_session_arg("hasn", {RESERVED_WORK_SESSION_ARG: "llm-faked", "q": 1})
+    assert RESERVED_WORK_SESSION_ARG not in out
+    assert out["q"] == 1
+
+
+def test_stamp_work_session_noop_for_third_party_server():
+    # 第三方 MCP 绝不注入（它们不 strip 该保留参数，注入即污染入参 schema）。
+    token = set_hasn_work_session_id("ws-7")
+    try:
+        original = {"x": 1}
+        for server in ("qcc", "filesystem", "slack"):
+            out = stamp_work_session_arg(server, original)
+            assert out is original
+            assert RESERVED_WORK_SESSION_ARG not in out
+    finally:
+        reset_hasn_work_session_id(token)
+
+
+def test_stamp_work_session_tolerates_non_mapping_args():
+    token = set_hasn_work_session_id("ws-1")
+    try:
+        assert stamp_work_session_arg("hasn", None) is None
+        assert stamp_work_session_arg("hasn", "raw") == "raw"
+    finally:
+        reset_hasn_work_session_id(token)
+
+
+def test_session_and_work_session_stamps_chain_independently():
+    # 会话轴分流的核心契约：两轨链式调用（mcp_tool.py 里 session 先、work_session 后），
+    # 各写各的键、互不干扰——runtime 值与工作会话值同时落在一次调用上。
+    s_token = set_hasn_session_id("rt-sess-9")
+    w_token = set_hasn_work_session_id("ws-9")
+    try:
+        args = {"body": "内容"}
+        args = stamp_session_arg("hasn", args)
+        args = stamp_work_session_arg("hasn", args)
+        assert args[RESERVED_SESSION_ARG] == "rt-sess-9"
+        assert args[RESERVED_WORK_SESSION_ARG] == "ws-9"
+        assert args["body"] == "内容"
+    finally:
+        reset_hasn_work_session_id(w_token)
+        reset_hasn_session_id(s_token)
+
+
+def test_work_session_stamp_alone_when_im_main_session():
+    # IM 主会话派发形态：runtime 轨有值、工作会话轨空——session 键注入、
+    # work_session 键被 strip（若 LLM 误填），产物不进任何工作会话资源栏。
+    s_token = set_hasn_session_id("rt-main-1")
+    try:
+        args = {RESERVED_WORK_SESSION_ARG: "llm-faked-ws"}
+        args = stamp_session_arg("hasn", args)  # 有 runtime 会话 → 注入
+        args = stamp_work_session_arg("hasn", args)  # 无工作会话 → strip
+        assert args[RESERVED_SESSION_ARG] == "rt-main-1"
+        assert RESERVED_WORK_SESSION_ARG not in args
+    finally:
+        reset_hasn_session_id(s_token)

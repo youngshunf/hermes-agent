@@ -25,6 +25,13 @@ per-(owner,agent) 会话无关）时采纳它作为本次调用的会话身份�
 只对唤星自有的两个 MCP 服务打标（``hasn`` 本地 daemon + ``cloud`` 云端平台工具直连）：
 两者都会在 server 侧 strip 掉该保留参数（hasn-mcp ``server.rs`` / 云端 ``server.call_tool``
 的 register-on-write 提取点，ARTREG-2）；第三方 MCP 不 strip，注入会污染入参 schema，绝不打标。
+
+**会话轴分流（设计 02 §4.3）**
+
+daemon 透传的 ``session_id`` 恒为**运行时/逻辑会话**语义（哪个 session 发就回哪个 session），
+继续盖 ``_hasn_session_id``；``work_session_id`` 是**工作会话**语义（仅任务/appcollab 派发
+非空，IM 主会话派发恒 None），盖 ``_hasn_work_session_id``——云端据它把产物落工作会话列。
+两键分轨绑定、分轨打标，互不干扰。
 """
 
 from __future__ import annotations
@@ -34,7 +41,16 @@ from contextvars import ContextVar, Token
 from typing import Any, Mapping, Optional, Sequence
 
 # 与 hasn-mcp（Rust）auth.rs::RESERVED_SESSION_ARG 严格一致。
+# 设计 02 §4.3 会话轴分流后，daemon 透传的 ``session_id`` 恒为**运行时/逻辑会话**语义
+# （IM 续接路由、message.send 回灌定位），本键继续承载它。
 RESERVED_SESSION_ARG = "_hasn_session_id"
+
+# 与 hasn-mcp（Rust）auth.rs::RESERVED_WORK_SESSION_ARG + 云端
+# trust_gate.py::RESERVED_WORK_SESSION_ID 逐字一致（设计 02 §4.3 会话轴分流）。
+# 本次派发所属的**工作会话** id：仅真实工作会话派发（任务/appcollab）时非空，
+# IM 主会话派发恒 None。云端据它把产物落 ``hasn_artifacts.work_session_id`` 列
+# （工作会话资源栏）；分身（LLM）不允许、也不需要自己填。
+RESERVED_WORK_SESSION_ARG = "_hasn_work_session_id"
 
 # 与 hasn-mcp（Rust）auth.rs::RESERVED_PROJECT_ARG + 云端 _project_id_var 提取键
 # 严格一致（PJ U5b）。本次派发所属的平台项目 id，随会话身份一同系统注入，供云端
@@ -75,6 +91,13 @@ _CANONICAL_TOOL_NAME = re.compile(r"^hasn(?:\.[A-Za-z0-9_-]+)+$")
 # 任务局部的当前 run 会话 id（daemon 透传的 ``session_id``）。并发会话互不串扰。
 _HASN_SESSION_ID: "ContextVar[Optional[str]]" = ContextVar(
     "HUANXING_HASN_SESSION_ID", default=None
+)
+
+# 任务局部的当前 run **工作会话** id（daemon 透传的 ``work_session_id``，设计 02 §4.3）。
+# 与 ``_HASN_SESSION_ID``（运行时轴）严格分工、同轨绑定；IM 主会话派发时为 ``None``
+# （不注入、并 strip 掉 LLM 误填的保留参数），并发派发互不串扰。
+_HASN_WORK_SESSION_ID: "ContextVar[Optional[str]]" = ContextVar(
+    "HUANXING_HASN_WORK_SESSION_ID", default=None
 )
 
 # 任务局部的当前 run 平台项目 id（daemon 透传的 ``project_id``）。与会话 id 同轨、
@@ -192,6 +215,28 @@ def get_hasn_session_id() -> Optional[str]:
     return _HASN_SESSION_ID.get()
 
 
+def set_hasn_work_session_id(work_session_id: Optional[str]) -> Token:
+    """绑定当前 run 的**工作会话** id，返回 reset token（``finally`` 里 ``reset_hasn_work_session_id``）。
+
+    与 ``set_hasn_session_id`` 同轨（设计 02 §4.3 会话轴分流）：传入空/None 表示
+    「本次派发不属于任何工作会话」（IM 主会话派发即此形态），此时
+    ``get_hasn_work_session_id`` 返回 ``None``，工具处理器不注入、并 strip 掉 LLM
+    误填的保留参数。
+    """
+    normalized = work_session_id.strip() if isinstance(work_session_id, str) else None
+    return _HASN_WORK_SESSION_ID.set(normalized or None)
+
+
+def reset_hasn_work_session_id(token: Token) -> None:
+    """复原 ``set_hasn_work_session_id`` 的绑定（run 结束时调用，保持任务局部不外泄）。"""
+    _HASN_WORK_SESSION_ID.reset(token)
+
+
+def get_hasn_work_session_id() -> Optional[str]:
+    """读取当前 run 的工作会话 id；未绑定/为空返回 ``None``。"""
+    return _HASN_WORK_SESSION_ID.get()
+
+
 def set_hasn_project_id(project_id: Optional[str]) -> Token:
     """绑定当前 run 的平台项目 id，返回 reset token（在 ``finally`` 里 ``reset_hasn_project_id``）。
 
@@ -231,6 +276,35 @@ def stamp_session_arg(server_name: str, args: Any) -> Any:
         return {**args, RESERVED_SESSION_ARG: session_id}
     if RESERVED_SESSION_ARG in args:
         return {key: value for key, value in args.items() if key != RESERVED_SESSION_ARG}
+    return args
+
+
+def stamp_work_session_arg(server_name: str, args: Any) -> Any:
+    """对**唤星自有 MCP 服务**（``hasn`` 本地 / ``cloud`` 云端平台工具）的出站调用参数
+    注入系统侧 ``_hasn_work_session_id``（设计 02 §4.3 会话轴分流）。
+
+    与 ``stamp_session_arg`` 同规则、同不变量（纯函数、不修改入参、只对唤星自有服务打标）：
+
+    - 非唤星自有服务（第三方 MCP）→ 原样返回，绝不注入（它们不 strip，注入即污染）；
+    - 当前 run 有工作会话 id → 覆盖式写入 ``_hasn_work_session_id``（分身无法控制它）；
+    - 当前 run 无工作会话 id（IM 主会话派发）→ strip 掉 LLM 误填的
+      ``_hasn_work_session_id``（杜绝分身自填污染工作会话轴）。
+
+    应在 ``stamp_session_arg`` 之后链式调用（两者互不干扰，各自增删自己的保留键）。
+    """
+    if server_name not in HASN_STAMPED_MCP_SERVERS:
+        return args
+    if not isinstance(args, Mapping):
+        return args
+    work_session_id = get_hasn_work_session_id()
+    if work_session_id:
+        return {**args, RESERVED_WORK_SESSION_ARG: work_session_id}
+    if RESERVED_WORK_SESSION_ARG in args:
+        return {
+            key: value
+            for key, value in args.items()
+            if key != RESERVED_WORK_SESSION_ARG
+        }
     return args
 
 

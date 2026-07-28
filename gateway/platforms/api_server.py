@@ -5194,9 +5194,11 @@ class APIServerAdapter(BasePlatformAdapter):
                         reset_hasn_allowed_tool_names,
                         reset_hasn_project_id,
                         reset_hasn_session_id,
+                        reset_hasn_work_session_id,
                         set_hasn_allowed_tool_names,
                         set_hasn_project_id,
                         set_hasn_session_id,
+                        set_hasn_work_session_id,
                     )
                     from gateway.session_context import clear_session_vars
                     from tools.approval import (
@@ -5215,6 +5217,12 @@ class APIServerAdapter(BasePlatformAdapter):
                     # 仅当调用方真送了 session_id 才绑（run_id 兜底不是真实会话，绑了反而误导）。
                     hasn_session_token = None
                     daemon_session_id = body.get("session_id") or stored_session_id
+                    # 会话轴分流（设计 02 §4.3）：daemon 透传的 ``work_session_id`` 是
+                    # **工作会话**语义（仅任务/appcollab 派发非空，IM 主会话派发无此键），
+                    # 与 ``session_id``（运行时轴）分轨绑定，供工具调用盖
+                    # ``_hasn_work_session_id``——云端据此把产物落工作会话列。
+                    hasn_work_session_token = None
+                    daemon_work_session_id = body.get("work_session_id")
                     # PJ U5b：把 daemon 透传的 project_id 与会话 id 同轨绑到本 run 执行线程，
                     # 供本地 hasn / cloud 平台工具系统侧注入 ``_hasn_project_id``——云端
                     # register-on-write 据此把产出资源打到项目名下。非项目派发时 body 无
@@ -5235,6 +5243,10 @@ class APIServerAdapter(BasePlatformAdapter):
                             )
                             if daemon_session_id:
                                 hasn_session_token = set_hasn_session_id(daemon_session_id)
+                            if daemon_work_session_id:
+                                hasn_work_session_token = set_hasn_work_session_id(
+                                    daemon_work_session_id
+                                )
                             if daemon_project_id:
                                 hasn_project_token = set_hasn_project_id(daemon_project_id)
                             hasn_allowed_tools_token = set_hasn_allowed_tool_names(
@@ -5257,6 +5269,11 @@ class APIServerAdapter(BasePlatformAdapter):
                             if hasn_project_token is not None:
                                 try:
                                     reset_hasn_project_id(hasn_project_token)
+                                except Exception:
+                                    pass
+                            if hasn_work_session_token is not None:
+                                try:
+                                    reset_hasn_work_session_id(hasn_work_session_token)
                                 except Exception:
                                     pass
                             if hasn_session_token is not None:

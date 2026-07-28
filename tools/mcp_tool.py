@@ -121,6 +121,13 @@ except Exception:  # pragma: no cover - gateway 不可导入的进程（CLI/cron
     _stamp_hasn_session_arg = None
 
 try:
+    from gateway.hasn_session import (
+        stamp_work_session_arg as _stamp_hasn_work_session_arg,
+    )
+except Exception:  # pragma: no cover - gateway 不可导入的进程（CLI/cron）
+    _stamp_hasn_work_session_arg = None
+
+try:
     from gateway.hasn_session import stamp_project_arg as _stamp_hasn_project_arg
 except Exception:  # pragma: no cover - gateway 不可导入的进程（CLI/cron）
     _stamp_hasn_project_arg = None
@@ -4114,6 +4121,17 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             except Exception:
                 logger.debug(
                     "MCP server '%s': stamp _hasn_session_id failed (ignored)",
+                    server_name,
+                )
+        # 唤星补丁（设计 02 §4.3 会话轴分流）：同轨注入 _hasn_work_session_id——
+        # 工作会话派发时云端据此把产物落工作会话列（会话资源栏）；IM 主会话派发无绑定，
+        # stamp 内会 strip 掉 LLM 误填。在 session 打标之后链式调用，各管各键。失败不阻断。
+        if _stamp_hasn_work_session_arg is not None:
+            try:
+                args = _stamp_hasn_work_session_arg(server_name, args)
+            except Exception:
+                logger.debug(
+                    "MCP server '%s': stamp _hasn_work_session_id failed (ignored)",
                     server_name,
                 )
         # 唤星补丁（PJ U5b）：同轨注入 _hasn_project_id，让云端 register-on-write
