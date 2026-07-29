@@ -26,6 +26,8 @@ from agent.skill_utils import (
     get_disabled_skill_names,
     iter_skill_index_files,
     parse_frontmatter,
+    read_external_skill_index_generation,
+    read_local_skill_index_generation,
     skill_matches_environment,
     skill_matches_platform,
     skill_matches_platform_list,
@@ -1493,7 +1495,12 @@ def build_skills_system_prompt(
     disabled = get_disabled_skill_names(_platform_hint or None)
     cache_key = (
         str(skills_dir),
+        read_local_skill_index_generation(),
         tuple(str(d) for d in external_dirs),
+        tuple(
+            (str(directory), read_external_skill_index_generation(directory))
+            for directory in external_dirs
+        ),
         tuple(sorted(str(t) for t in (available_tools or set()))),
         tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
         _platform_hint,

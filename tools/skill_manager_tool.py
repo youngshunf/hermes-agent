@@ -1388,10 +1388,16 @@ def skill_manage(
 
     if result.get("success"):
         try:
+            from agent.skill_utils import advance_local_skill_index_generation
             from agent.prompt_builder import clear_skills_system_prompt_cache
+
+            result["index_generation"] = advance_local_skill_index_generation()
             clear_skills_system_prompt_cache(clear_snapshot=True)
-        except Exception:
-            pass
+        except Exception as exc:
+            # 技能写入已经原子提交，不能伪装成未发生；向调用方和日志显式暴露
+            # generation 推进失败，后续可再次编辑或触发受管 provisioning 修复。
+            logger.error("技能已提交，但技能索引 generation 推进失败", exc_info=True)
+            result["index_generation_error"] = str(exc)
         # Curator telemetry: bump patch_count on edit/patch/write_file (the actions
         # that mutate an existing skill's guidance), drop the record on delete.
         # Only mark a skill as agent-created when the background self-improvement

@@ -9,10 +9,18 @@ import logging
 import os
 import re
 import sys
+import tempfile
+import time
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from hermes_constants import get_config_path, get_skills_dir, is_termux
+from hermes_constants import (
+    get_config_path,
+    get_hermes_home,
+    get_skills_dir,
+    is_termux,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +56,69 @@ EXCLUDED_SKILL_DIRS = frozenset(
 # be scanned for active SKILL.md/DESCRIPTION.md entries, even if a Curator or
 # archive workflow preserves a complete old skill package under references/.
 SKILL_SUPPORT_DIRS = frozenset(("references", "templates", "assets", "scripts"))
+
+_LOCAL_SKILL_INDEX_GENERATION_FILE = ".skill-index-generation"
+_EXTERNAL_SKILL_INDEX_FILE = ".index.json"
+
+
+def read_local_skill_index_generation() -> str:
+    """读取当前 profile 的技能索引 generation；缺失或空文件视为初始值 ``0``。"""
+    marker = get_hermes_home() / _LOCAL_SKILL_INDEX_GENERATION_FILE
+    try:
+        value = marker.read_text(encoding="utf-8").strip()
+    except OSError:
+        return "0"
+    return value or "0"
+
+
+def advance_local_skill_index_generation() -> str:
+    """在技能文件完整提交后原子推进当前 profile 的索引 generation。
+
+    generation 是不透明变更令牌，不承担业务排序语义。每次使用唯一值并以
+    ``os.replace`` 提交，可避免多个 writer 先读后加一导致的丢更新。
+    """
+    home = get_hermes_home()
+    home.mkdir(parents=True, exist_ok=True)
+    marker = home / _LOCAL_SKILL_INDEX_GENERATION_FILE
+    generation = f"{time.time_ns()}-{uuid.uuid4().hex}"
+    fd, temporary = tempfile.mkstemp(
+        dir=str(home),
+        prefix=f".{_LOCAL_SKILL_INDEX_GENERATION_FILE}.tmp.",
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(generation)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, marker)
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+    return generation
+
+
+def read_external_skill_index_generation(skills_dir: Path) -> str:
+    """读取受管 external directory 相邻 ``.index.json`` 的 revision。
+
+    Runtime 的共享技能目录形如 ``common/skills``，账本位于
+    ``common/.index.json``。损坏或缺失账本不能臆造新 generation，按初始值
+    ``0`` 处理，由受管 writer 在完整提交后原子推进 revision。
+    """
+    index_path = Path(skills_dir).parent / _EXTERNAL_SKILL_INDEX_FILE
+    try:
+        value = yaml_load(index_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return "0"
+    if not isinstance(value, dict):
+        return "0"
+    revision = value.get("revision")
+    if revision is None:
+        return "0"
+    normalized = str(revision).strip()
+    return normalized or "0"
 
 
 def is_excluded_skill_path(path) -> bool:
