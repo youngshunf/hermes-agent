@@ -116,6 +116,14 @@ _BILLING_PATTERNS = [
     "account is deactivated",
     "plan does not include",
     "out of extra usage",  # Anthropic OAuth Pro/Max overage bucket depleted (HTTP 400)
+    # 订阅制套餐用尽（Kimi Coding 一类按 billing cycle 计量的套餐，HTTP 403）。
+    # 原文形如 "You've reached your usage limit for this billing cycle. Your quota
+    # will be refreshed in the next cycle. To continue now, purchase extra usage
+    # or upgrade your plan"——一条既有 billing pattern 都不匹配，会被 403 分支
+    # 兜底判成 auth，主人看到的是「认证失败」而不是「额度用尽，去续费」。
+    "reached your usage limit",
+    "quota will be refreshed",
+    "purchase extra usage",
     "out of funds",
     "run out of funds",
     "balance_depleted",
@@ -394,6 +402,39 @@ _AUTH_PATTERNS = [
     "token expired",
     "token revoked",
     "access denied",
+]
+
+# 中转网关把上游非 2xx 原样透传时留下的无语义标记。
+#
+# new-api 一类网关在上游返回错误时，自身并没有判定出任何凭据/权限/额度问题，
+# 只是把状态码转发下来，body 里既没有可读原因，也没有 provider 侧的结构化
+# code，只剩一个占位 message：
+#
+#     {"error": {"message": "openai_error", "type": "bad_response_status_code",
+#                "code": "bad_response_status_code"}}
+#
+# 这类 403 实测是上游供应商的瞬时故障（几分钟后自愈），不是权限问题。
+_OPAQUE_GATEWAY_PASSTHROUGH_MARKERS = [
+    "bad_response_status_code",  # new-api：上游返回非 2xx 时的统一包装
+    "openai_error",              # new-api：无法解析上游错误体时填的占位 message
+]
+
+# 判「网关包装里其实带了真实认证语义」时，_AUTH_PATTERNS 之外要补的线索。
+#
+# _AUTH_PATTERNS 全是英文，而 new-api 这类自建网关的错误文案常常是中文
+# （实测 "API Key 所属分组已删除"），只靠英文列表会把确凿的凭据失效误判成
+# 可重试的瞬时故障，白白多烧一次调用。这些线索只用于收窄下面的 403 放行
+# 判据，不参与全局 auth 分类，避免影响其他 provider 的既有行为。
+_OPAQUE_403_AUTH_HINTS = [
+    "api key",
+    "apikey",
+    "api_key",
+    "令牌",
+    "密钥",
+    "鉴权",
+    "认证",
+    "无权",
+    "权限",
 ]
 
 # Anthropic thinking block signature patterns
@@ -914,6 +955,27 @@ def _classify_by_status(
                 FailoverReason.billing,
                 retryable=False,
                 should_rotate_credential=True,
+                should_fallback=True,
+            )
+        # 中转网关无语义透传的 403 → 当作上游瞬时故障，退避重试。
+        #
+        # 归到下面的 auth 会让整轮对话一次机会都不给就掉进 fallback 链：实测
+        # 一次「上游抖 1 秒」被放大成整个任务执行失败（主模型 403 → fallback
+        # 到的模型恰好额度耗尽 → 全链失败）。凭据其实完好，重试一次大概率成功。
+        #
+        # 判据收窄到「网关明确表示自己没意见」且「错误体不含任何认证/权限语义」
+        # 两者同时成立，避免把真实的 key 失效/无权限当成可重试。重试耗尽后仍走
+        # fallback（见 conversation_loop 的 retry_count >= max_retries 分支），
+        # 最终行为不变，只是多给一次机会。
+        if (
+            any(m in error_msg for m in _OPAQUE_GATEWAY_PASSTHROUGH_MARKERS)
+            or error_code in _OPAQUE_GATEWAY_PASSTHROUGH_MARKERS
+        ) and not any(
+            p in error_msg for p in (*_AUTH_PATTERNS, *_OPAQUE_403_AUTH_HINTS)
+        ):
+            return result_fn(
+                FailoverReason.server_error,
+                retryable=True,
                 should_fallback=True,
             )
         return result_fn(
