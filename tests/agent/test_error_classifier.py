@@ -261,6 +261,92 @@ class TestClassifyApiError:
         result = classify_api_error(e, provider="openrouter")
         assert result.reason == FailoverReason.billing
 
+    def test_403_opaque_gateway_passthrough_is_retryable(self):
+        """new-api 无语义透传的 403 是上游瞬时故障，应退避重试而非当权限失败。
+
+        实测：主模型收到这条 403 后一次机会都不给就掉进 fallback 链，而
+        fallback 到的模型恰好额度耗尽，一次上游抖动放大成整个任务执行失败。
+        """
+        e = MockAPIError(
+            "Error code: 403 - {'error': {'message': 'openai_error', "
+            "'type': 'bad_response_status_code', 'param': '', "
+            "'code': 'bad_response_status_code'}}",
+            status_code=403,
+            body={
+                "error": {
+                    "message": "openai_error",
+                    "type": "bad_response_status_code",
+                    "code": "bad_response_status_code",
+                }
+            },
+        )
+        result = classify_api_error(e, provider="custom")
+        assert result.reason == FailoverReason.server_error
+        assert result.retryable is True
+        # 重试耗尽后仍然要能切到备用模型，最终行为不变。
+        assert result.should_fallback is True
+
+    def test_403_opaque_marker_with_auth_semantics_stays_auth(self):
+        """网关包装里带了真实的认证语义时，不得放行成可重试。"""
+        e = MockAPIError(
+            "Error code: 403 - {'error': {'message': 'invalid api key', "
+            "'type': 'bad_response_status_code', "
+            "'code': 'bad_response_status_code'}}",
+            status_code=403,
+            body={
+                "error": {
+                    "message": "invalid api key",
+                    "type": "bad_response_status_code",
+                    "code": "bad_response_status_code",
+                }
+            },
+        )
+        result = classify_api_error(e, provider="custom")
+        assert result.reason == FailoverReason.auth
+        assert result.retryable is False
+
+    def test_403_opaque_marker_with_chinese_auth_semantics_stays_auth(self):
+        """自建网关的中文认证错误也不得被放行成可重试（_AUTH_PATTERNS 全是英文）。"""
+        e = MockAPIError(
+            "Error code: 403 - {'error': {'message': 'API Key 所属分组已删除', "
+            "'type': 'bad_response_status_code', "
+            "'code': 'bad_response_status_code'}}",
+            status_code=403,
+            body={
+                "error": {
+                    "message": "API Key 所属分组已删除",
+                    "type": "bad_response_status_code",
+                    "code": "bad_response_status_code",
+                }
+            },
+        )
+        result = classify_api_error(e, provider="custom")
+        assert result.reason == FailoverReason.auth
+        assert result.retryable is False
+
+    def test_403_subscription_usage_limit_is_billing(self):
+        """Kimi Coding 一类订阅套餐用尽（403）应判 billing，而不是 auth。"""
+        e = MockAPIError(
+            "Error code: 403",
+            status_code=403,
+            body={
+                "error": {
+                    "message": (
+                        "You've reached your usage limit for this billing cycle. "
+                        "Your quota will be refreshed in the next cycle. To continue "
+                        "now, purchase extra usage or upgrade your plan: "
+                        "https://example.com/billing"
+                    ),
+                    "type": "access_terminated_error",
+                    "code": None,
+                }
+            },
+        )
+        result = classify_api_error(e, provider="custom")
+        assert result.reason == FailoverReason.billing
+        assert result.retryable is False
+        assert result.should_fallback is True
+
     # ── Billing ──
 
     def test_402_plain_billing(self):
