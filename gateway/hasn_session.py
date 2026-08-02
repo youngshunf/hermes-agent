@@ -57,6 +57,16 @@ RESERVED_WORK_SESSION_ARG = "_hasn_work_session_id"
 # register-on-write 把产出资源打到项目名下；分身（LLM）不允许、也不需要自己填。
 RESERVED_PROJECT_ARG = "_hasn_project_id"
 
+# 与 hasn-mcp（Rust）auth.rs::RESERVED_WORKING_DIRECTORY_ARG 严格一致。
+# 本机绝对路径只允许发送给本地 ``hasn`` MCP 服务；云端 ``cloud`` 必须剥离，
+# 防止把某台设备的磁盘信息写入云端请求、日志或持久化数据。
+RESERVED_WORKING_DIRECTORY_ARG = "_hasn_working_directory"
+
+# 与 hasn-mcp（Rust）auth.rs::RESERVED_CONTEXT_CAPABILITY_ARG 严格一致。
+# daemon 为本次项目 run 签发的本地能力凭据；只盖给本地 ``hasn`` MCP，cloud/第三方
+# 绝不接收。MCP server 用它核对身份、项目、会话、目录和工具白名单。
+RESERVED_CONTEXT_CAPABILITY_ARG = "_hasn_context_capability"
+
 # 与 hasn-mcp（Rust）auth.rs::RESERVED_ALLOWED_TOOL_NAMES_ARG 及云端
 # trust_gate.py::RESERVED_ALLOWED_TOOL_NAMES 严格一致。它承载本次工作会话可调用的
 # canonical 工具名；由 Runtime 在模型输出后覆盖式注入，分身不可自填。
@@ -104,6 +114,16 @@ _HASN_WORK_SESSION_ID: "ContextVar[Optional[str]]" = ContextVar(
 # 并发派发互不串扰；非项目派发时为 ``None``（云端 register-on-write 不打标，零影响面）。
 _HASN_PROJECT_ID: "ContextVar[Optional[str]]" = ContextVar(
     "HUANXING_HASN_PROJECT_ID", default=None
+)
+
+# 任务局部的可信本机工作目录。该值来自 daemon 的 project_workspaces 映射，
+# 只用于本地工具根目录，不进入 cloud MCP 调用。
+_HASN_WORKING_DIRECTORY: "ContextVar[Optional[str]]" = ContextVar(
+    "HUANXING_HASN_WORKING_DIRECTORY", default=None
+)
+
+_HASN_CONTEXT_CAPABILITY: "ContextVar[Optional[str]]" = ContextVar(
+    "HUANXING_HASN_CONTEXT_CAPABILITY", default=None
 )
 
 # 任务局部的当前 run 精确工具白名单。``None`` 表示兼容旧调用、不限制；空 tuple
@@ -257,6 +277,42 @@ def get_hasn_project_id() -> Optional[str]:
     return _HASN_PROJECT_ID.get()
 
 
+def set_hasn_working_directory(working_directory: Optional[str]) -> Token:
+    """绑定当前 run 的可信本机工作目录，返回供 ``finally`` 复原的 token。"""
+    normalized = (
+        working_directory.strip()
+        if isinstance(working_directory, str)
+        else None
+    )
+    return _HASN_WORKING_DIRECTORY.set(normalized or None)
+
+
+def reset_hasn_working_directory(token: Token) -> None:
+    """复原当前 run 的本机工作目录绑定。"""
+    _HASN_WORKING_DIRECTORY.reset(token)
+
+
+def get_hasn_working_directory() -> Optional[str]:
+    """读取当前 run 的可信本机工作目录；未绑定时返回 ``None``。"""
+    return _HASN_WORKING_DIRECTORY.get()
+
+
+def set_hasn_context_capability(capability: Optional[str]) -> Token:
+    """绑定当前项目 run 的 daemon 能力凭据，返回供 ``finally`` 复原的 token。"""
+    normalized = capability.strip() if isinstance(capability, str) else None
+    return _HASN_CONTEXT_CAPABILITY.set(normalized or None)
+
+
+def reset_hasn_context_capability(token: Token) -> None:
+    """复原当前 run 的项目上下文能力凭据。"""
+    _HASN_CONTEXT_CAPABILITY.reset(token)
+
+
+def get_hasn_context_capability() -> Optional[str]:
+    """读取当前 run 的项目上下文能力凭据；未绑定时返回 ``None``。"""
+    return _HASN_CONTEXT_CAPABILITY.get()
+
+
 def stamp_session_arg(server_name: str, args: Any) -> Any:
     """对**唤星自有 MCP 服务**（``hasn`` 本地 / ``cloud`` 云端平台工具）的出站调用参数
     注入系统侧 ``_hasn_session_id``。
@@ -329,4 +385,44 @@ def stamp_project_arg(server_name: str, args: Any) -> Any:
         return {**args, RESERVED_PROJECT_ARG: project_id}
     if RESERVED_PROJECT_ARG in args:
         return {key: value for key, value in args.items() if key != RESERVED_PROJECT_ARG}
+    return args
+
+
+def stamp_working_directory_arg(server_name: str, args: Any) -> Any:
+    """只向本地 ``hasn`` MCP 调用注入可信工作目录。
+
+    ``cloud`` 调用无条件剥离该保留参数，第三方 MCP 保持原样；当前 run 未绑定目录时，
+    本地调用也会剥离模型伪造值。函数不修改原入参。
+    """
+    if server_name not in HASN_STAMPED_MCP_SERVERS:
+        return args
+    if not isinstance(args, Mapping):
+        return args
+    working_directory = get_hasn_working_directory()
+    if server_name == HASN_LOCAL_MCP_SERVER and working_directory:
+        return {**args, RESERVED_WORKING_DIRECTORY_ARG: working_directory}
+    if RESERVED_WORKING_DIRECTORY_ARG in args:
+        return {
+            key: value
+            for key, value in args.items()
+            if key != RESERVED_WORKING_DIRECTORY_ARG
+        }
+    return args
+
+
+def stamp_context_capability_arg(server_name: str, args: Any) -> Any:
+    """只向本地 ``hasn`` MCP 调用盖入 daemon 签发能力，其余服务无条件剥离。"""
+    if server_name not in HASN_STAMPED_MCP_SERVERS:
+        return args
+    if not isinstance(args, Mapping):
+        return args
+    capability = get_hasn_context_capability()
+    if server_name == HASN_LOCAL_MCP_SERVER and capability:
+        return {**args, RESERVED_CONTEXT_CAPABILITY_ARG: capability}
+    if RESERVED_CONTEXT_CAPABILITY_ARG in args:
+        return {
+            key: value
+            for key, value in args.items()
+            if key != RESERVED_CONTEXT_CAPABILITY_ARG
+        }
     return args

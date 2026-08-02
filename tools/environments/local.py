@@ -1238,10 +1238,8 @@ class LocalEnvironment(BaseEnvironment):
             normalized = _msys_to_windows_path(self.cwd) if _IS_WINDOWS else self.cwd
             if safe_cwd != normalized:
                 logger.warning(
-                    "LocalEnvironment cwd %r is missing on disk; "
-                    "falling back to %r so terminal commands keep working.",
-                    self.cwd,
-                    safe_cwd,
+                    "LocalEnvironment cwd is missing on disk; "
+                    "process bootstrap moved to a safe ancestor while command cwd remains fail-closed."
                 )
             self.cwd = safe_cwd
 
@@ -1386,6 +1384,8 @@ class LocalEnvironment(BaseEnvironment):
                 # Stale / non-existent path — keep previous cwd; _run_bash
                 # will resolve a safe fallback on the next call if needed.
                 self.cwd = prev_cwd
+            # ``_cwd`` 必须反映规范化或回退后的本次结果，不能保留解析前的路径。
+            result["_cwd"] = self.cwd
 
     def cleanup(self):
         """Clean up temp files."""

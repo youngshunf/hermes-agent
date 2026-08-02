@@ -129,6 +129,8 @@ class TestRunBashCwdRecovery:
 
         # The warning surfaces the wedge so it isn't silently masked.
         assert any("missing on disk" in rec.message for rec in caplog.records)
+        assert str(wedged) not in caplog.text
+        assert str(tmp_path) not in caplog.text
 
     def test_no_warning_when_cwd_still_exists(self, tmp_path, caplog):
         with patch.object(LocalEnvironment, "init_session", autospec=True, return_value=None):
@@ -165,11 +167,11 @@ class TestUpdateCwdRejectsMissingPaths:
         deleted = tmp_path / "wedge-repro"
         marker = env._cwd_marker
 
-        env._update_cwd(
-            {"output": f"x\n{marker}{deleted}{marker}\n", "returncode": 0}
-        )
+        result = {"output": f"x\n{marker}{deleted}{marker}\n", "returncode": 0}
+        env._update_cwd(result)
 
         assert env.cwd == str(original)
+        assert result["_cwd"] == str(original)
 
     def test_accepts_assignment_when_marker_path_exists(self, tmp_path):
         original = tmp_path / "starting"
@@ -181,8 +183,8 @@ class TestUpdateCwdRejectsMissingPaths:
             env = LocalEnvironment(cwd=str(original), timeout=10)
         marker = env._cwd_marker
 
-        env._update_cwd(
-            {"output": f"x\n{marker}{new_dir}{marker}\n", "returncode": 0}
-        )
+        result = {"output": f"x\n{marker}{new_dir}{marker}\n", "returncode": 0}
+        env._update_cwd(result)
 
         assert env.cwd == str(new_dir)
+        assert result["_cwd"] == str(new_dir)

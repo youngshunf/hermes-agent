@@ -10,6 +10,10 @@ Covers:
 
 import asyncio
 import json
+import os
+import secrets
+import subprocess
+import sys
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -22,6 +26,7 @@ from gateway.config import PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
     _approval_event_choices,
+    _validate_project_runtime_context,
     cors_middleware,
     security_headers_middleware,
 )
@@ -49,6 +54,238 @@ def test_approval_event_choices_follow_backend_capabilities(
         smart_denied=smart_denied,
         allow_permanent=allow_permanent,
     ) == expected
+
+
+def test_project_runtime_context_accepts_canonical_writable_directory(tmp_path):
+    """项目 run 只接受 daemon 已定稿的本机节点与规范绝对目录。"""
+    workspace = tmp_path / "项目工作区"
+    workspace.mkdir()
+
+    context = _validate_project_runtime_context({
+        "project_id": "project-42",
+        "node_id": "node-local",
+        "working_directory": str(workspace),
+    })
+
+    assert context == ("project-42", "node-local", str(workspace))
+
+
+def test_project_runtime_context_drives_real_terminal_sentinel(tmp_path):
+    """随机哨兵证明真实本地终端在项目目录执行，且响应不泄露绝对根。"""
+    workspace = tmp_path / "实际运行目录"
+    workspace.mkdir()
+    sentinel = secrets.token_hex(24)
+    (workspace / "runtime-sentinel.txt").write_text(sentinel, encoding="utf-8")
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    script = """
+import json
+import sys
+from tools import terminal_tool
+
+task_id = "doc42-real-pwd"
+terminal_tool.register_task_env_overrides(
+    task_id,
+    {
+        "cwd": sys.argv[1],
+        "isolate_environment": True,
+        "restrict_file_tools_to_cwd": True,
+    },
+)
+try:
+    result = json.loads(
+        terminal_tool.terminal_tool(
+            command="cat runtime-sentinel.txt",
+            task_id=task_id,
+        )
+    )
+    print(json.dumps(result, ensure_ascii=False))
+finally:
+    terminal_tool.cleanup_vm(task_id, force_remove=True)
+    terminal_tool.clear_task_env_overrides(task_id)
+"""
+    env = os.environ.copy()
+    env.update({
+        "HERMES_HOME": str(hermes_home),
+        "TERMINAL_ENV": "local",
+        "TERMINAL_LOCAL_PERSISTENT": "false",
+    })
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(workspace)],
+        cwd=os.getcwd(),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    result = json.loads(completed.stdout.strip().splitlines()[-1])
+    assert result["exit_code"] == 0, result
+    assert result["output"].strip() == sentinel
+    assert str(workspace) not in json.dumps(result, ensure_ascii=False)
+
+
+def test_same_session_concurrent_runs_keep_terminal_and_files_isolated(tmp_path):
+    """同一会话并发 run 必须各自读写自己的项目目录。"""
+    workspace_a = tmp_path / "项目甲"
+    workspace_b = tmp_path / "项目乙"
+    workspace_a.mkdir()
+    workspace_b.mkdir()
+    (workspace_a / "sentinel.txt").write_text("甲目录", encoding="utf-8")
+    (workspace_b / "sentinel.txt").write_text("乙目录", encoding="utf-8")
+    hermes_home = tmp_path / "hermes-home-concurrent"
+    hermes_home.mkdir()
+    script = """
+import json
+import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
+from tools import terminal_tool
+from tools.file_tools import read_file_tool
+
+runs = {
+    "same-session-run-a": (sys.argv[1], "甲目录"),
+    "same-session-run-b": (sys.argv[2], "乙目录"),
+}
+start = threading.Barrier(2)
+
+for task_id, (cwd, _) in runs.items():
+    terminal_tool.register_task_env_overrides(
+        task_id,
+        {
+            "cwd": cwd,
+            "isolate_environment": True,
+            "restrict_file_tools_to_cwd": True,
+        },
+    )
+
+def execute_run(task_id, cwd, expected):
+    start.wait()
+    read_result = json.loads(read_file_tool("sentinel.txt", task_id=task_id))
+    terminal_result = json.loads(
+        terminal_tool.terminal_tool(
+            command=f"sleep 0.2; printf '{expected}' > terminal-sentinel.txt; cat sentinel.txt",
+            task_id=task_id,
+        )
+    )
+    return {
+        "content": read_result.get("content", ""),
+        "terminal_output": terminal_result.get("output", "").strip(),
+        "exit_code": terminal_result.get("exit_code"),
+        "expected": expected,
+        "environment_id": id(terminal_tool._active_environments[task_id]),
+    }
+
+try:
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = {
+            task_id: executor.submit(execute_run, task_id, cwd, expected)
+            for task_id, (cwd, expected) in runs.items()
+        }
+        results = {task_id: future.result() for task_id, future in futures.items()}
+    print(json.dumps(results, ensure_ascii=False))
+finally:
+    for task_id in runs:
+        terminal_tool.cleanup_vm(task_id, force_remove=True)
+        terminal_tool.clear_task_env_overrides(task_id)
+"""
+    env = os.environ.copy()
+    env.update({
+        "HERMES_HOME": str(hermes_home),
+        "TERMINAL_ENV": "local",
+        "TERMINAL_LOCAL_PERSISTENT": "false",
+    })
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(workspace_a), str(workspace_b)],
+        cwd=os.getcwd(),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    results = json.loads(completed.stdout.strip().splitlines()[-1])
+    run_a = results["same-session-run-a"]
+    run_b = results["same-session-run-b"]
+    assert run_a["expected"] in run_a["content"]
+    assert run_b["expected"] in run_b["content"]
+    assert run_a["terminal_output"] == "甲目录"
+    assert run_b["terminal_output"] == "乙目录"
+    assert run_a["exit_code"] == 0
+    assert run_b["exit_code"] == 0
+    assert run_a["environment_id"] != run_b["environment_id"]
+    assert str(workspace_a) not in completed.stdout
+    assert str(workspace_b) not in completed.stdout
+    assert (workspace_a / "terminal-sentinel.txt").read_text(
+        encoding="utf-8"
+    ) == "甲目录"
+    assert (workspace_b / "terminal-sentinel.txt").read_text(
+        encoding="utf-8"
+    ) == "乙目录"
+
+
+def test_nonproject_runtime_context_accepts_explicit_directory(tmp_path):
+    """非项目工作会话仍可使用调用方显式定稿的目录。"""
+    workspace = tmp_path / "standalone"
+    workspace.mkdir()
+
+    assert _validate_project_runtime_context({"working_directory": str(workspace)}) == (
+        None,
+        None,
+        str(workspace),
+    )
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"project_id": "project-42"},
+        {
+            "project_id": "project-42",
+            "node_id": "node-local",
+        },
+        {
+            "project_id": "project-42",
+            "working_directory": "/tmp/project-42",
+        },
+        {
+            "node_id": "node-local",
+            "working_directory": "/tmp/project-42",
+        },
+    ],
+)
+def test_project_runtime_context_rejects_partial_triplet(body):
+    """项目、本机节点、工作目录必须成组出现，禁止缺字段后回落默认目录。"""
+    with pytest.raises(ValueError, match="project runtime context"):
+        _validate_project_runtime_context(body)
+
+
+def test_project_runtime_context_rejects_noncanonical_or_non_directory(tmp_path):
+    """Runtime 入口再次验证目录，拒绝相对路径、文件与含父级跳转的路径。"""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    plain_file = tmp_path / "file.txt"
+    plain_file.write_text("内容", encoding="utf-8")
+
+    invalid_paths = [
+        "relative/path",
+        str(plain_file),
+        str(workspace / ".." / "workspace"),
+    ]
+    for invalid_path in invalid_paths:
+        with pytest.raises(ValueError, match="working_directory"):
+            _validate_project_runtime_context({
+                "project_id": "project-42",
+                "node_id": "node-local",
+                "working_directory": invalid_path,
+            })
 
 
 def _make_adapter(api_key: str = "") -> APIServerAdapter:
@@ -512,7 +749,7 @@ class TestRunStatus:
                     await asyncio.sleep(0.05)
 
                 mock_agent.run_conversation.assert_called_once()
-                assert mock_agent.run_conversation.call_args.kwargs["task_id"] == "space-session"
+                assert mock_agent.run_conversation.call_args.kwargs["task_id"] == run_id
                 assert status["session_id"] == "space-session"
 
     @pytest.mark.asyncio

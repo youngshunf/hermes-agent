@@ -737,13 +737,21 @@ def _build_child_system_prompt(
 
 
 def _resolve_workspace_hint(parent_agent) -> Optional[str]:
-    """Best-effort local workspace hint for child prompts.
+    """解析子分身提示词使用的可信本地工作目录。"""
+    active_task_id = getattr(parent_agent, "_current_task_id", None)
+    try:
+        from tools.terminal_tool import get_session_cwd, resolve_task_overrides
 
-    We only inject a path when we have a concrete absolute directory. This avoids
-    teaching subagents a fake container path while still helping them avoid
-    guessing `/workspace/...` for local repo tasks.
-    """
+        active_overrides = resolve_task_overrides(active_task_id)
+        # 受限项目已经通过工具执行上下文继承 cwd；绝对路径不得再进入模型提示词。
+        if active_overrides.get("restrict_file_tools_to_cwd") is True:
+            return None
+
+        active_session_cwd = get_session_cwd(active_task_id)
+    except Exception:
+        active_session_cwd = None
     candidates = [
+        active_session_cwd,
         os.getenv("TERMINAL_CWD"),
         getattr(
             getattr(parent_agent, "_subdirectory_hints", None), "working_dir", None
@@ -1743,6 +1751,25 @@ def _apply_summary_budget(results: List[Dict[str, Any]], parent_agent) -> None:
         )
 
 
+def _derive_child_env_overrides(
+    parent_overrides: Dict[str, Any], inherited_cwd: Optional[str]
+) -> Optional[Dict[str, Any]]:
+    """派生子分身执行目录配置，并原样继承项目根限制。"""
+    if not isinstance(inherited_cwd, str) or not inherited_cwd.strip():
+        return None
+    isolated = parent_overrides.get("isolate_environment") is True
+    restricted = parent_overrides.get("restrict_file_tools_to_cwd") is True
+    if not isolated and not restricted:
+        return None
+    child_overrides: Dict[str, Any] = {
+        "cwd": inherited_cwd,
+        "isolate_environment": True,
+    }
+    if restricted:
+        child_overrides["restrict_file_tools_to_cwd"] = True
+    return child_overrides
+
+
 def _run_single_child(
     task_index: int,
     goal: str,
@@ -1755,6 +1782,8 @@ def _run_single_child(
     Returns a structured result dict.
     """
     child_start = time.monotonic()
+    child_task_id: Optional[str] = None
+    child_env_registered = False
 
     # Get the progress callback from the child agent
     child_progress_cb = getattr(child, "tool_progress_callback", None)
@@ -1913,9 +1942,25 @@ def _run_single_child(
         # isolated in its own record (a child's cd no longer bleeds back into
         # the parent once readers flip to the record store).
         try:
-            from tools.terminal_tool import get_session_cwd, record_session_cwd
+            from tools.terminal_tool import (
+                get_session_cwd,
+                record_session_cwd,
+                register_task_env_overrides,
+                resolve_task_overrides,
+            )
 
-            record_session_cwd(child_task_id, get_session_cwd(parent_task_id))
+            parent_overrides = resolve_task_overrides(parent_task_id)
+            inherited_cwd = get_session_cwd(parent_task_id) or parent_overrides.get(
+                "cwd"
+            )
+            record_session_cwd(child_task_id, inherited_cwd)
+            child_overrides = _derive_child_env_overrides(
+                parent_overrides,
+                inherited_cwd,
+            )
+            if child_overrides is not None:
+                register_task_env_overrides(child_task_id, child_overrides)
+                child_env_registered = True
         except Exception as e:
             logger.debug("Child cwd seed failed: %s", e)
         wall_start = time.time()
@@ -1963,7 +2008,11 @@ def _run_single_child(
                 stream_callback=_relay_child_text,
             )
 
-        _child_future = _timeout_executor.submit(_run_with_thread_capture)
+        from tools.thread_context import propagate_context_to_thread
+
+        _child_future = _timeout_executor.submit(
+            propagate_context_to_thread(_run_with_thread_capture)
+        )
         try:
             result = _child_future.result(timeout=child_timeout)
         except Exception as _timeout_exc:
@@ -2354,6 +2403,22 @@ def _run_single_child(
         except Exception:
             logger.debug("Failed to close child agent after delegation")
 
+        if child_task_id:
+            try:
+                from tools.terminal_tool import (
+                    cleanup_vm,
+                    clear_session_cwd,
+                    clear_task_env_overrides,
+                )
+
+                if child_env_registered:
+                    cleanup_vm(child_task_id, force_remove=True)
+                    clear_task_env_overrides(child_task_id)
+                else:
+                    clear_session_cwd(child_task_id)
+            except Exception:
+                logger.debug("分身结束后清理 cwd 失败")
+
 
 def _recover_tasks_from_json_string(
     tasks: Any,
@@ -2576,11 +2641,13 @@ def delegate_task(
             # normally, but if the parent is interrupted while a child is
             # wedged, the abandoned worker must not block interpreter exit.
             from tools.daemon_pool import DaemonThreadPoolExecutor
+            from tools.thread_context import propagate_context_to_thread
+
             with DaemonThreadPoolExecutor(max_workers=max_children) as executor:
                 futures = {}
                 for i, t, child in children:
                     future = executor.submit(
-                        _run_single_child,
+                        propagate_context_to_thread(_run_single_child),
                         task_index=i,
                         goal=t["goal"],
                         child=child,

@@ -2,6 +2,8 @@
 """File Tools Module - LLM agent file manipulation tools."""
 
 import errno
+from functools import wraps
+import inspect
 import json
 import logging
 import os
@@ -24,6 +26,53 @@ logger = logging.getLogger(__name__)
 
 
 _EXPECTED_WRITE_ERRNOS = {errno.EACCES, errno.EPERM, errno.EROFS}
+
+
+def _project_result_boundary(function):
+    """统一清理项目文件工具的模型可见结果，内部仍可使用规范绝对路径。"""
+    function_signature = inspect.signature(function)
+
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        bound = function_signature.bind_partial(*args, **kwargs)
+        task_id = bound.arguments.get("task_id", "default")
+        from tools.terminal_tool import (
+            PROJECT_WORKSPACE_BOUNDARY_CODE,
+            ProjectWorkspaceBoundaryError,
+            redact_project_workspace_paths,
+        )
+
+        try:
+            result = function(*args, **kwargs)
+        except ProjectWorkspaceBoundaryError as error:
+            result = json.dumps(
+                {
+                    "error": str(error),
+                    "status": "blocked",
+                },
+                ensure_ascii=False,
+            )
+        try:
+            payload = json.loads(result)
+        except (TypeError, json.JSONDecodeError):
+            payload = None
+        if isinstance(payload, dict) and str(payload.get("error", "")).startswith(
+            PROJECT_WORKSPACE_BOUNDARY_CODE
+        ):
+            payload["status"] = "blocked"
+            result = json.dumps(payload, ensure_ascii=False)
+
+        return redact_project_workspace_paths(result, task_id)
+
+    return wrapped
+
+
+def _reraise_project_workspace_boundary(error: Exception) -> None:
+    """避免兼容性降级分支吞掉项目根边界拒绝。"""
+    from tools.terminal_tool import ProjectWorkspaceBoundaryError
+
+    if isinstance(error, ProjectWorkspaceBoundaryError):
+        raise error
 
 
 def _expand_tilde(path: str) -> str:
@@ -371,6 +420,12 @@ def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path | Pu
     translated to ``C:\\Users\\...`` before resolution so file tools don't
     treat them as relative ``\\c\\Users\\...`` under the process cwd.
     """
+    from tools.terminal_tool import resolve_project_relative_path
+
+    project_path = resolve_project_relative_path(filepath, task_id)
+    if project_path is not None:
+        return project_path
+
     container_paths = _uses_container_paths(task_id)
     if container_paths:
         expanded = _expand_tilde(filepath)
@@ -524,8 +579,21 @@ def _search_result_read_block_error(path: str, task_id: str = "default") -> str 
     resolution before applying the shared read guard.
     """
     try:
-        resolved = _resolve_path_for_task(path, task_id)
-    except (OSError, ValueError, RuntimeError):
+        from tools.terminal_tool import (
+            ProjectWorkspaceBoundaryError,
+            project_workspace_root_for_task,
+        )
+
+        project_root = project_workspace_root_for_task(task_id)
+        candidate = Path(path)
+        if project_root is not None and candidate.is_absolute():
+            resolved = candidate.resolve(strict=False)
+            if not resolved.is_relative_to(project_root):
+                raise ProjectWorkspaceBoundaryError()
+        else:
+            resolved = _resolve_path_for_task(path, task_id)
+    except (OSError, ValueError, RuntimeError) as error:
+        _reraise_project_workspace_boundary(error)
         return get_read_block_error(path)
     return get_read_block_error(str(resolved))
 
@@ -597,7 +665,8 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
     """Return an error message if the path targets a sensitive system location."""
     try:
         resolved = str(_resolve_path_for_task(filepath, task_id))
-    except (OSError, ValueError):
+    except (OSError, ValueError) as error:
+        _reraise_project_workspace_boundary(error)
         resolved = filepath
     normalized = os.path.normpath(_expand_tilde(filepath))
     _err = (
@@ -700,7 +769,8 @@ def _check_cross_profile_path(filepath: str, task_id: str = "default") -> str | 
     # classified against the right base.
     try:
         resolved = str(_resolve_path_for_task(filepath, task_id))
-    except (OSError, ValueError):
+    except (OSError, ValueError) as error:
+        _reraise_project_workspace_boundary(error)
         resolved = filepath
 
     warning = get_cross_profile_warning(resolved)
@@ -1106,7 +1176,10 @@ def clear_file_ops_cache(task_id: str = None):
             _file_ops_cache.clear()
 
 
-def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = "default") -> str:
+@_project_result_boundary
+def read_file_tool(
+    path: str, offset: int = 1, limit: int = 500, task_id: str = "default"
+) -> str:
     """Read a file with pagination and line numbers."""
     try:
         offset, limit = normalize_read_pagination(offset, limit)
@@ -1268,7 +1341,9 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
 
         # ── Perform the read ──────────────────────────────────────────
         file_ops = _get_file_ops(task_id)
-        result = file_ops.read_file(path, offset, limit)
+        # 解析结果已经绑定当前 task 的目录；必须把绝对路径交给底层，避免共享
+        # 环境的可变 cwd 在并发窗口内把相对路径重新解释到另一个项目。
+        result = file_ops.read_file(str(_resolved), offset, limit)
         result_dict = result.to_dict()
 
         # ── Character-count guard ─────────────────────────────────────
@@ -1569,9 +1644,14 @@ def _mark_verification_stale(
         logger.debug("verification stale marker failed", exc_info=True)
 
 
-def write_file_tool(path: str, content: str, task_id: str = "default",
-                    cross_profile: bool = False,
-                    session_id: str | None = None) -> str:
+@_project_result_boundary
+def write_file_tool(
+    path: str,
+    content: str,
+    task_id: str = "default",
+    cross_profile: bool = False,
+    session_id: str | None = None,
+) -> str:
     """Write content to a file.
 
     ``cross_profile`` opts out of the soft cross-Hermes-profile guard. The
@@ -1599,7 +1679,8 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
         # check below still runs.
         try:
             _resolved = str(_resolve_path_for_task(path, task_id))
-        except Exception:
+        except Exception as error:
+            _reraise_project_workspace_boundary(error)
             _resolved = None
 
         if _resolved is None:
@@ -1652,10 +1733,18 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
         return tool_error(str(e))
 
 
-def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
-               new_string: str = None, replace_all: bool = False, patch: str = None,
-               task_id: str = "default", cross_profile: bool = False,
-               session_id: str | None = None) -> str:
+@_project_result_boundary
+def patch_tool(
+    mode: str = "replace",
+    path: str = None,
+    old_string: str = None,
+    new_string: str = None,
+    replace_all: bool = False,
+    patch: str = None,
+    task_id: str = "default",
+    cross_profile: bool = False,
+    session_id: str | None = None,
+) -> str:
     """Patch a file using replace mode or V4A patch format.
 
     ``cross_profile`` opts out of the soft cross-Hermes-profile guard for
@@ -1724,7 +1813,8 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         for _p in _paths_to_check:
             try:
                 _r = str(_resolve_path_for_task(_p, task_id))
-            except Exception:
+            except Exception as error:
+                _reraise_project_workspace_boundary(error)
                 _r = None
             if _r and _r not in _seen:
                 _resolved_paths.append(_r)
@@ -1746,7 +1836,8 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             for _p in _paths_to_check:
                 try:
                     _r = str(_resolve_path_for_task(_p, task_id))
-                except Exception:
+                except Exception as error:
+                    _reraise_project_workspace_boundary(error)
                     _r = None
                 _path_to_resolved[_p] = _r
                 _cross = file_state.check_stale(task_id, _r) if _r else None
@@ -1846,10 +1937,18 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         return tool_error(str(e))
 
 
-def search_tool(pattern: str, target: str = "content", path: str = ".",
-                file_glob: str = None, limit: int = 50, offset: int = 0,
-                output_mode: str = "content", context: int = 0,
-                task_id: str = "default") -> str:
+@_project_result_boundary
+def search_tool(
+    pattern: str,
+    target: str = "content",
+    path: str = ".",
+    file_glob: str = None,
+    limit: int = 50,
+    offset: int = 0,
+    output_mode: str = "content",
+    context: int = 0,
+    task_id: str = "default",
+) -> str:
     """Search for content or files."""
     try:
         offset, limit = normalize_search_pagination(offset, limit)
@@ -1890,7 +1989,8 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
 
         try:
             resolved_path = _resolve_path_for_task(path, task_id)
-        except (OSError, ValueError, RuntimeError):
+        except (OSError, ValueError, RuntimeError) as error:
+            _reraise_project_workspace_boundary(error)
             resolved_path = None
         block_error = get_read_block_error(str(resolved_path) if resolved_path else path)
         if block_error:
@@ -1898,8 +1998,14 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
 
         file_ops = _get_file_ops(task_id)
         result = file_ops.search(
-            pattern=pattern, path=path, target=target, file_glob=file_glob,
-            limit=limit, offset=offset, output_mode=output_mode, context=context
+            pattern=pattern,
+            path=str(resolved_path) if resolved_path is not None else path,
+            target=target,
+            file_glob=file_glob,
+            limit=limit,
+            offset=offset,
+            output_mode=output_mode,
+            context=context,
         )
         omitted = _filter_read_blocked_search_results(result, task_id)
         if hasattr(result, 'matches'):
@@ -1950,9 +2056,22 @@ READ_FILE_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "path": {"type": "string", "description": "Path to the file to read (absolute, relative, or ~/path)"},
-            "offset": {"type": "integer", "description": "Line number to start reading from (1-indexed, default: 1)", "default": 1, "minimum": 1},
-            "limit": {"type": "integer", "description": "Maximum number of lines to read (default: 500, max: 2000)", "default": 500, "maximum": 2000}
+            "path": {
+                "type": "string",
+                "description": "Path to the file to read (absolute, relative, or ~/path). Project runs accept only paths relative to the current project root.",
+            },
+            "offset": {
+                "type": "integer",
+                "description": "Line number to start reading from (1-indexed, default: 1)",
+                "default": 1,
+                "minimum": 1,
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Maximum number of lines to read (default: 500, max: 2000)",
+                "default": 500,
+                "maximum": 2000,
+            },
         },
         "required": ["path"]
     }
@@ -1964,8 +2083,14 @@ WRITE_FILE_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "path": {"type": "string", "description": "Path to the file to write (will be created if it doesn't exist, overwritten if it does)"},
-            "content": {"type": "string", "description": "Complete content to write to the file"},
+            "path": {
+                "type": "string",
+                "description": "Path to the file to write (will be created if it doesn't exist, overwritten if it does). Project runs accept only paths relative to the current project root.",
+            },
+            "content": {
+                "type": "string",
+                "description": "Complete content to write to the file",
+            },
             "cross_profile": {
                 "type": "boolean",
                 "description": "Opt out of the cross-profile soft guard. Defaults to false. Set true ONLY after explicit user direction to edit another Hermes profile's skills/plugins/cron/memories — by default these writes are blocked with a warning because they affect a different profile than the one this session is running under.",
@@ -1998,7 +2123,7 @@ PATCH_SCHEMA = {
             },
             "path": {
                 "type": "string",
-                "description": "REQUIRED when mode='replace'. File path to edit.",
+                "description": "REQUIRED when mode='replace'. File path to edit. Project runs accept only paths relative to the current project root.",
             },
             "old_string": {
                 "type": "string",
@@ -2015,7 +2140,7 @@ PATCH_SCHEMA = {
             },
             "patch": {
                 "type": "string",
-                "description": "REQUIRED when mode='patch'. V4A format patch content. Format:\n*** Begin Patch\n*** Update File: path/to/file\n@@ context hint @@\n context line\n-removed line\n+added line\n*** End Patch",
+                "description": "REQUIRED when mode='patch'. V4A format patch content. Project runs require every header path to be relative to the current project root. Format:\n*** Begin Patch\n*** Update File: path/to/file\n@@ context hint @@\n context line\n-removed line\n+added line\n*** End Patch",
             },
             "cross_profile": {
                 "type": "boolean",
@@ -2033,14 +2158,46 @@ SEARCH_FILES_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "pattern": {"type": "string", "description": "Regex pattern for content search, or glob pattern (e.g., '*.py') for file search"},
-            "target": {"type": "string", "enum": ["content", "files"], "description": "'content' searches inside file contents, 'files' searches for files by name", "default": "content"},
-            "path": {"type": "string", "description": "Directory or file to search in (default: current working directory)", "default": "."},
-            "file_glob": {"type": "string", "description": "Filter files by pattern in grep mode (e.g., '*.py' to only search Python files)"},
-            "limit": {"type": "integer", "description": "Maximum number of results to return (default: 50)", "default": 50},
-            "offset": {"type": "integer", "description": "Skip first N results for pagination (default: 0)", "default": 0},
-            "output_mode": {"type": "string", "enum": ["content", "files_only", "count"], "description": "Output format for grep mode: 'content' shows matching lines with line numbers, 'files_only' lists file paths, 'count' shows match counts per file", "default": "content"},
-            "context": {"type": "integer", "description": "Number of context lines before and after each match (grep mode only)", "default": 0}
+            "pattern": {
+                "type": "string",
+                "description": "Regex pattern for content search, or glob pattern (e.g., '*.py') for file search",
+            },
+            "target": {
+                "type": "string",
+                "enum": ["content", "files"],
+                "description": "'content' searches inside file contents, 'files' searches for files by name",
+                "default": "content",
+            },
+            "path": {
+                "type": "string",
+                "description": "Directory or file to search in (default: current working directory). Project runs accept only paths relative to the current project root.",
+                "default": ".",
+            },
+            "file_glob": {
+                "type": "string",
+                "description": "Filter files by pattern in grep mode (e.g., '*.py' to only search Python files)",
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Maximum number of results to return (default: 50)",
+                "default": 50,
+            },
+            "offset": {
+                "type": "integer",
+                "description": "Skip first N results for pagination (default: 0)",
+                "default": 0,
+            },
+            "output_mode": {
+                "type": "string",
+                "enum": ["content", "files_only", "count"],
+                "description": "Output format for grep mode: 'content' shows matching lines with line numbers, 'files_only' lists file paths, 'count' shows match counts per file",
+                "default": "content",
+            },
+            "context": {
+                "type": "integer",
+                "description": "Number of context lines before and after each match (grep mode only)",
+                "default": 0,
+            },
         },
         "required": ["pattern"]
     }

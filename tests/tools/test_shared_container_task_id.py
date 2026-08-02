@@ -124,6 +124,21 @@ def test_cwd_only_override_collapses_to_default():
         terminal_tool.clear_task_env_overrides("acp-session-abc")
 
 
+def test_explicit_environment_isolation_keeps_run_id():
+    """并发项目 run 显式请求隔离后，必须持有各自的环境键。"""
+    terminal_tool.register_task_env_overrides(
+        "project-run-42",
+        {"cwd": "/home/user/project", "isolate_environment": True},
+    )
+    try:
+        assert (
+            terminal_tool._resolve_container_task_id("project-run-42")
+            == "project-run-42"
+        )
+    finally:
+        terminal_tool.clear_task_env_overrides("project-run-42")
+
+
 def test_cwd_plus_docker_image_keeps_own_id():
     """When overrides include both cwd AND docker_image, isolation must
     still be honoured (RL/benchmark pattern with explicit cwd)."""

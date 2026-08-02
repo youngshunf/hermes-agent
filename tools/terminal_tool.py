@@ -36,13 +36,14 @@ import json
 import logging
 import os
 import platform
+import posixpath
 import re
 import time
 import threading
 import atexit
 import shutil
 import subprocess
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Optional, Dict, Any, List
 
 from utils import env_var_enabled
@@ -1133,6 +1134,8 @@ def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
         - modal_image: str -- Path to Dockerfile or Docker Hub image name
         - docker_image: str -- Docker image name
         - cwd: str -- Working directory inside the sandbox
+        - isolate_environment: bool -- 是否为当前任务创建独立环境
+        - restrict_file_tools_to_cwd: bool -- 项目任务把文件工具和 terminal workdir 锁在 cwd 内
 
     Args:
         task_id: The rollout's unique task identifier
@@ -1150,14 +1153,10 @@ def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
         # A registered workspace cwd IS the session's working directory until
         # a `cd` changes it.
         record_session_cwd(task_id, new_cwd)
-        # The live env is cached under the raw task_id for per-session surfaces
-        # (ACP/gateway/dashboard) and under the collapsed container id for
-        # isolation-keyed rollouts. Try the raw id first, then the container id,
-        # so a CWD-only override (which collapses to "default") still finds and
-        # updates the originating session's env.
-        container_id = _resolve_container_task_id(task_id)
+        # 只允许更新任务自己持有的环境。折叠后的 ``default`` 环境可能正被另一个
+        # 并发会话使用，修改它的 cwd 会把后续相对路径导向错误项目。
         with _env_lock:
-            env = _active_environments.get(task_id) or _active_environments.get(container_id)
+            env = _active_environments.get(task_id)
         if env is not None and getattr(env, "cwd", None) is not None:
             env.cwd = new_cwd
 
@@ -1191,10 +1190,8 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
     rollouts need their own isolated sandbox, which is the whole point of
     the override.
 
-    CWD-only overrides (registered by the ACP adapter for workspace
-    tracking) are *not* isolation signals — they should not cause each
-    session to spin up its own container.  Only overrides containing
-    backend-specific image keys or ``env_type`` trigger isolation.
+    仅含 cwd 的覆盖项仍供 ACP 工作区跟踪，不默认触发隔离；并发项目 run 可显式传
+    ``isolate_environment=True``。后端镜像键与 ``env_type`` 继续自动触发隔离。
     """
     _ISOLATION_KEYS = frozenset({
         "docker_image", "modal_image", "singularity_image",
@@ -1202,7 +1199,10 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
     })
     if task_id and task_id in _task_env_overrides:
         overrides = _task_env_overrides[task_id]
-        if set(overrides.keys()) & _ISOLATION_KEYS:
+        if (
+            overrides.get("isolate_environment") is True
+            or set(overrides.keys()) & _ISOLATION_KEYS
+        ):
             return task_id
     return "default"
 
@@ -1225,6 +1225,108 @@ def resolve_task_overrides(task_id: Optional[str]) -> Dict[str, Any]:
         or _task_env_overrides.get(_resolve_container_task_id(raw))
         or {}
     )
+
+
+PROJECT_WORKSPACE_BOUNDARY_CODE = "PROJECT_WORKSPACE_BOUNDARY"
+
+
+class ProjectWorkspaceBoundaryError(ValueError):
+    """项目工具参数试图离开 daemon 定稿的本机项目根。"""
+
+    def __init__(self, message: str = "项目工具只允许使用当前项目根内的相对路径"):
+        super().__init__(f"{PROJECT_WORKSPACE_BOUNDARY_CODE}: {message}")
+
+
+def project_workspace_root_for_task(task_id: Optional[str]) -> Optional[Path]:
+    """返回项目受限任务的实时规范根；根失效或被替换时立即拒绝。"""
+    overrides = resolve_task_overrides(task_id)
+    if overrides.get("restrict_file_tools_to_cwd") is not True:
+        return None
+    raw = overrides.get("cwd")
+    if not isinstance(raw, str) or not raw.strip():
+        raise ProjectWorkspaceBoundaryError("项目工作目录缺失")
+    root = Path(os.path.expanduser(raw.strip()))
+    if not root.is_absolute():
+        raise ProjectWorkspaceBoundaryError("项目工作目录不是规范绝对目录")
+    try:
+        canonical = root.resolve(strict=True)
+    except OSError as exc:
+        raise ProjectWorkspaceBoundaryError("项目工作目录已不可用") from exc
+    if canonical != root or not canonical.is_dir():
+        raise ProjectWorkspaceBoundaryError("项目工作目录边界已变化")
+    return canonical
+
+
+def resolve_project_relative_path(
+    value: str,
+    task_id: Optional[str],
+    *,
+    require_directory: bool = False,
+) -> Optional[Path]:
+    """项目受限任务只解析根内相对路径；普通任务返回 ``None`` 保持原行为。"""
+    root = project_workspace_root_for_task(task_id)
+    if root is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ProjectWorkspaceBoundaryError("路径不能为空")
+    raw = value.strip()
+    import ntpath
+
+    if raw.startswith("~") or posixpath.isabs(raw) or ntpath.isabs(raw):
+        raise ProjectWorkspaceBoundaryError()
+    portable_parts = PurePosixPath(raw.replace("\\", "/")).parts
+    if ".." in portable_parts:
+        raise ProjectWorkspaceBoundaryError()
+    try:
+        resolved = (root / raw).resolve(strict=False)
+    except OSError as exc:
+        raise ProjectWorkspaceBoundaryError("路径无法规范化") from exc
+    if not resolved.is_relative_to(root):
+        raise ProjectWorkspaceBoundaryError()
+    if require_directory and not resolved.is_dir():
+        raise ProjectWorkspaceBoundaryError("terminal workdir 必须是项目根内已存在的目录")
+    return resolved
+
+
+def redact_project_workspace_paths(result: str, task_id: Optional[str]) -> str:
+    """在工具结果出站给模型前，把项目绝对根稳定转换为逻辑相对表示。"""
+    overrides = resolve_task_overrides(task_id)
+    if overrides.get("restrict_file_tools_to_cwd") is not True:
+        return result
+    raw = overrides.get("cwd")
+    if not isinstance(raw, str) or not raw.strip():
+        return result
+    roots = {raw.strip(), os.path.expanduser(raw.strip())}
+    try:
+        roots.add(str(Path(raw.strip()).resolve(strict=False)))
+    except OSError:
+        pass
+    roots = {root.rstrip("/\\") for root in roots if root.rstrip("/\\")}
+
+    def scrub_text(text: str) -> str:
+        for root in sorted(roots, key=len, reverse=True):
+            text = text.replace(f"{root}/", "").replace(f"{root}\\", "")
+            text = re.sub(
+                re.escape(root) + r"(?=$|[\s'\"`:;,\)\]])",
+                ".",
+                text,
+            )
+        return text
+
+    def scrub(value):
+        if isinstance(value, str):
+            return scrub_text(value)
+        if isinstance(value, list):
+            return [scrub(item) for item in value]
+        if isinstance(value, dict):
+            return {key: scrub(item) for key, item in value.items()}
+        return value
+
+    try:
+        payload = json.loads(result)
+    except (TypeError, json.JSONDecodeError):
+        return scrub_text(result)
+    return json.dumps(scrub(payload), ensure_ascii=False)
 
 
 # Configuration from environment variables
@@ -2082,22 +2184,31 @@ def _resolve_command_cwd(
     workdir: Optional[str],
     default_cwd: str,
     session_key: Optional[str] = None,
+    task_id: Optional[str] = None,
 ) -> str:
-    """Return the cwd for a command. Explicit ``workdir=`` overrides everything.
+    """解析命令 cwd；项目任务固定在项目根，普通任务保持显式 ``workdir`` 优先。
 
-    Otherwise the session's own cwd RECORD (``get_session_cwd``) wins — it is
-    written after every completed command for this session, so it IS the
-    session's ``cd`` state, with no shared-env ambiguity: another session's
-    ``cd`` lands in another record and can't affect us. A session with no
-    record yet (first command) runs in ``default_cwd`` (config/override cwd),
-    which is also what seeds a fresh environment.
+    项目任务的相对 ``workdir`` 会在项目根内规范化，绝对路径、父级跳转、符号链接逃逸
+    和失效目录均显式拒绝。非项目任务仍按原契约使用显式 ``workdir``，否则使用会话记录。
     """
+    project_root = project_workspace_root_for_task(task_id)
+    if project_root is not None:
+        if workdir:
+            resolved = resolve_project_relative_path(
+                workdir,
+                task_id,
+                require_directory=True,
+            )
+            if resolved is None:
+                raise ProjectWorkspaceBoundaryError()
+            return str(resolved)
+        return str(project_root)
     if workdir:
         return workdir
     return get_session_cwd(session_key) or default_cwd
 
 
-def terminal_tool(
+def _terminal_tool_impl(
     command: str,
     background: bool = False,
     timeout: Optional[int] = None,
@@ -2184,6 +2295,29 @@ def terminal_tool(
             image = ""
 
         cwd = overrides.get("cwd") or get_session_cwd(task_id) or config["cwd"]
+        restricted_command_cwd = None
+        if overrides.get("restrict_file_tools_to_cwd") is True:
+            try:
+                if env_type in _CONTAINER_BACKENDS:
+                    raise ProjectWorkspaceBoundaryError(
+                        "容器后端尚未建立项目根的可信目录映射"
+                    )
+                restricted_command_cwd = _resolve_command_cwd(
+                    workdir=workdir,
+                    default_cwd=cwd,
+                    session_key=task_id,
+                    task_id=task_id,
+                )
+            except ProjectWorkspaceBoundaryError as exc:
+                return json.dumps(
+                    {
+                        "output": "",
+                        "exit_code": -1,
+                        "error": str(exc),
+                        "status": "blocked",
+                    },
+                    ensure_ascii=False,
+                )
         # A per-task cwd override (registered by the gateway/TUI for workspace
         # tracking, or by RL/benchmark envs) wins over config["cwd"] — but
         # config["cwd"] was already sanitized for container backends in
@@ -2463,7 +2597,10 @@ def terminal_tool(
                 workdir=workdir,
                 default_cwd=cwd,
                 session_key=session_key,
+                task_id=task_id,
             )
+            if restricted_command_cwd is not None:
+                effective_cwd = restricted_command_cwd
             try:
                 if env_type == "local":
                     proc_session = process_registry.spawn_local(
@@ -2723,7 +2860,10 @@ def terminal_tool(
                         workdir=workdir,
                         default_cwd=cwd,
                         session_key=session_key,
+                        task_id=task_id,
                     )
+                    if restricted_command_cwd is not None:
+                        command_cwd = restricted_command_cwd
                     execute_kwargs = {
                         "timeout": effective_timeout,
                         "cwd": command_cwd,
@@ -2764,13 +2904,10 @@ def terminal_tool(
                 # Got a result
                 break
 
-            # Dual-write (cwd rearch step 1): the env's post-command tracking
-            # (marker parse / local sync) has just updated env.cwd with the
-            # directory this command finished in. That cwd belongs to THIS
-            # session — record it under the session key so the durable record
-            # never depends on the shared env surviving or on who drives the
-            # env next.
-            record_session_cwd(session_key, getattr(env, "cwd", None))
+            # 每次执行的 marker 结果属于当前命令；不能在这里读取共享 env.cwd，
+            # 因为另一个并发命令可能已经覆盖它。
+            completed_cwd = result.get("_cwd") or command_cwd
+            record_session_cwd(session_key, completed_cwd)
 
             # Extract output
             output = result.get("output", "")
@@ -2906,6 +3043,34 @@ def terminal_tool(
             "traceback": tb_str,
             "status": "error"
         }, ensure_ascii=False)
+
+
+def terminal_tool(
+    command: str,
+    background: bool = False,
+    timeout: Optional[int] = None,
+    task_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    force: bool = False,
+    workdir: Optional[str] = None,
+    pty: bool = False,
+    notify_on_complete: bool = False,
+    watch_patterns: Optional[List[str]] = None,
+) -> str:
+    """执行终端命令，并在项目任务结果离开本机执行层前移除绝对项目根。"""
+    result = _terminal_tool_impl(
+        command=command,
+        background=background,
+        timeout=timeout,
+        task_id=task_id,
+        session_id=session_id,
+        force=force,
+        workdir=workdir,
+        pty=pty,
+        notify_on_complete=notify_on_complete,
+        watch_patterns=watch_patterns,
+    )
+    return redact_project_workspace_paths(result, task_id)
 
 
 def check_terminal_requirements() -> bool:
@@ -3092,7 +3257,7 @@ TERMINAL_SCHEMA = {
             },
             "workdir": {
                 "type": "string",
-                "description": "Working directory for this command (absolute path). Defaults to the session working directory."
+                "description": "Working directory for this command (absolute path). Defaults to the session working directory. Project runs accept only a directory relative to the current project root.",
             },
             "pty": {
                 "type": "boolean",
