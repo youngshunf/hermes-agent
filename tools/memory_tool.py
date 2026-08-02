@@ -28,7 +28,6 @@ import logging
 import os
 import tempfile
 import time
-import urllib.request
 from contextlib import contextmanager
 from pathlib import Path
 from hermes_constants import get_hermes_home
@@ -51,60 +50,216 @@ logger = logging.getLogger(__name__)
 
 
 # =============================================================================
-# 唤星 B 路统一：USER.md（owner 维度记忆）写入 → 云端 contribute 合并管线
+# 唤星写入单源：Hermes 原生 Markdown 写入 → hasn-node 本地结构化事实
 # =============================================================================
-# agent 用本工具写 target=user（USER.md）= owner 维度记忆（主人画像），应并入云端
-# owner_memory 合并管线（去重 / 消解冲突 / 回拉覆盖下发给主人所有分身），而不是只落本地、
-# 绕过云端、且在下次 profile re-pull 时被覆盖丢失。每次 USER.md 写入（add/replace）成功后，
-# best-effort 把这条写入内容作为「观察」上传 runtime host 的 memory/contribute 端点（host 在
-# 拉起 gateway 子进程时经 env 注入端点 URL / cloud_base / 本地 token）→ host 转云端 contribute
-# → LLM 合并 → 回拉刷新本地 USER.md。失败绝不影响已成功的本地写入（云端 sweeper 会兜底重试）。
-# MEMORY.md（target=memory）是 agent 私有演化记忆，不上传。
-_OWNER_MEMORY_OBSERVER: Optional[Callable[[str], None]] = None
+# USER.md 与 MEMORY.md 都只是运行时便利视图；事实权威在 hasn-node 的 memory.db。
+# 因此原生 memory 工具的 add/replace/remove/batch 都必须向结构化事实提交
+# 同义变更，不能把 replace 降级为另存一条，也不能吞掉 remove。
+MemoryFactMutation = Dict[str, str]
+MemoryFactObserver = Callable[[str, List[MemoryFactMutation]], None]
+_MEMORY_FACT_OBSERVER: Optional[MemoryFactObserver] = None
 
 
-def set_owner_memory_observer(observer: Optional[Callable[[str], None]]) -> None:
-    """注入 USER.md 写入观察者（测试用；默认走 env 配置的 host 端点 best-effort POST）。"""
-    global _OWNER_MEMORY_OBSERVER
-    _OWNER_MEMORY_OBSERVER = observer
+def set_memory_fact_observer(observer: Optional[MemoryFactObserver]) -> None:
+    """注入原生 Markdown 变更后的结构化事实观察者。"""
+    global _MEMORY_FACT_OBSERVER
+    _MEMORY_FACT_OBSERVER = observer
 
 
-def _notify_owner_memory_observation(content: str) -> None:
-    """USER.md 写入成功后回调观察者（best-effort，绝不抛出影响本地写入结果）。"""
-    if not content or not content.strip():
-        return
-    observer = _OWNER_MEMORY_OBSERVER or _default_owner_memory_observer
-    try:
-        observer(content.strip())
-    except Exception as exc:  # best-effort：上传失败不影响本地写入（云端 sweeper 兜底重试）
-        logger.warning("owner memory contribution notify failed: %s", exc)
+def _decode_local_memory_result(raw: Any) -> Dict[str, Any]:
+    """解开本地 MCP 包装器的多层 JSON 返回，并显式拒绝错误。"""
+    payload: Any = raw
+    for _ in range(4):
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"hasn 本地 MCP 返回了非 JSON 结果：{payload}") from exc
+            continue
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"hasn 本地 MCP 返回了非法结果：{payload!r}")
+        error = payload.get("error")
+        if error or payload.get("success") is False:
+            raise RuntimeError(str(error or payload))
+        nested = payload.get("result")
+        if isinstance(nested, (str, dict)):
+            payload = nested
+            continue
+        return payload
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        if error or payload.get("success") is False:
+            raise RuntimeError(str(error or payload))
+        return payload
+    raise RuntimeError("hasn 本地 MCP 返回层级过深或格式非法")
 
 
-def _default_owner_memory_observer(content: str) -> None:
-    """默认观察者：把 USER.md 写入条目 POST 到 host 的 memory/contribute 端点（env 配置）。
+def _dispatch_local_memory(name: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    """调用已连接的 hasn 本地工具包装器。"""
+    from tools.mcp_tool import mcp_prefixed_tool_name
+    from tools.registry import registry
 
-    host 在拉起 gateway 子进程时注入：
-      HUANXING_OWNER_MEMORY_CONTRIBUTE_URL    host 自身 memory/contribute 路由（本 profile）
-      HUANXING_CLOUD_BASE_URL                 云端 base（host 转云端 contribute 用，可选）
-      HUANXING_OWNER_MEMORY_CONTRIBUTE_TOKEN  host 本地鉴权 token（可选）
-    未配置（如纯 CLI 单机场景）则静默跳过——退回纯本地 USER.md 行为，不改变上游默认。
-    """
-    url = os.environ.get("HUANXING_OWNER_MEMORY_CONTRIBUTE_URL")
-    if not url:
-        return
-    body: Dict[str, Any] = {"content": content}
-    cloud_base = os.environ.get("HUANXING_CLOUD_BASE_URL")
-    if cloud_base:
-        body["cloud_base_url"] = cloud_base
-    data = json.dumps(body, ensure_ascii=False).encode("utf-8")
-    req = urllib.request.Request(
-        url, data=data, headers={"Content-Type": "application/json"}, method="POST"
+    wrapper_name = mcp_prefixed_tool_name("hasn", "hasn.local.tool.call")
+    if registry.get_entry(wrapper_name) is None:
+        raise RuntimeError("hasn 本地 MCP 未连接，无法同步结构化记忆")
+    return _decode_local_memory_result(
+        registry.dispatch(wrapper_name, {"name": name, "params": params})
     )
-    token = os.environ.get("HUANXING_OWNER_MEMORY_CONTRIBUTE_TOKEN")
-    if token:
-        req.add_header("Authorization", f"Bearer {token}")
-    with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310 (host 本地/受控 URL)
-        resp.read()
+
+
+def _list_native_memory_facts(
+    target: str,
+    content: str,
+    *,
+    include_status: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    """按全文精确列出原生条目对应的可编辑结构化事实。"""
+    subject_kind = "owner" if target == "user" else "agent_self"
+    # 精确条件必须在 hasn-node 的 SQL LIMIT 之前生效；否则事实超过 100 条后，
+    # 较老的 Hermes 原生条目会静默失去修改、删除和幂等寻址能力。
+    params: Dict[str, Any] = {
+        "subject_kind": subject_kind,
+        "predicate": "Hermes 原生记忆",
+        "object": content,
+        # 只寻址本节点自产片，且必须由 hasn-node 在 SQL LIMIT 之前过滤；否则较新的
+        # 远端同内容镜像会把本机可编辑事实挤出结果集。
+        "editable_only": True,
+        # 取两条以继续检测违反唯一性的存量重复，不把重复误判成成功。
+        "limit": 2,
+    }
+    if include_status:
+        params["include_status"] = include_status
+    payload = _dispatch_local_memory(
+        "hasn.memory.list",
+        params,
+    )
+    facts = payload.get("facts")
+    if not isinstance(facts, list):
+        raise RuntimeError("hasn.memory.list 缺少 facts 列表")
+    return [
+        fact
+        for fact in facts
+        if isinstance(fact, dict)
+        and fact.get("predicate") == "Hermes 原生记忆"
+        and fact.get("object") == content
+        and fact.get("editable") is not False
+    ]
+
+
+def _find_native_memory_fact(
+    target: str,
+    content: str,
+    *,
+    include_status: Optional[List[str]] = None,
+    required: bool = True,
+) -> Optional[Dict[str, Any]]:
+    """按原生条目全文找到唯一可编辑结构化事实。"""
+    matches = [
+        fact
+        for fact in _list_native_memory_facts(
+            target,
+            content,
+            include_status=include_status,
+        )
+    ]
+    if not matches and not required:
+        return None
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"期望找到 1 条可编辑的 Hermes 原生记忆，实际为 {len(matches)} 条"
+        )
+    return matches[0]
+
+
+def _default_memory_fact_observer(
+    target: str,
+    mutations: List[MemoryFactMutation],
+) -> None:
+    """将原生 Markdown 变更逐条投影为 hasn-node 本地结构化事实。"""
+    subject_kind = "owner" if target == "user" else "agent_self"
+    rationale = f"由 Hermes 原生 memory 工具写入 {target}"
+    for mutation in mutations:
+        action = mutation["action"]
+        if action == "add":
+            # 审批回放或上次同步中断后可能已经存在；按全文幂等确认，
+            # 避免重试再造一条重复事实。
+            existing = _find_native_memory_fact(
+                target,
+                mutation["content"],
+                required=False,
+            )
+            if existing is not None:
+                continue
+            _dispatch_local_memory(
+                "hasn.memory.save",
+                {
+                    "subject_kind": subject_kind,
+                    "predicate": "Hermes 原生记忆",
+                    "object": mutation["content"],
+                    "rationale": rationale,
+                },
+            )
+            continue
+
+        if action == "replace":
+            replacement = _find_native_memory_fact(
+                target,
+                mutation["content"],
+                required=False,
+            )
+            existing = _find_native_memory_fact(
+                target,
+                mutation["old_content"],
+                required=False,
+            )
+            # 上次重试若已经完成 update，旧文会消失、新文会存在；只有
+            # 这个组合才可以按幂等成功处理。新旧都在时仍必须更新旧事实。
+            if existing is None and replacement is not None:
+                continue
+        elif action == "remove":
+            existing = _find_native_memory_fact(
+                target,
+                mutation["old_content"],
+                include_status=["active", "withdrawn"],
+            )
+            if existing is not None and existing.get("status") == "withdrawn":
+                continue
+        else:
+            raise RuntimeError(f"未知的记忆变更动作：{action}")
+        if existing is None:
+            raise RuntimeError("Hermes 原生记忆不存在")
+        fact_id = existing.get("fact_id")
+        if not isinstance(fact_id, str) or not fact_id:
+            raise RuntimeError("Hermes 原生记忆缺少 fact_id")
+        if action == "replace":
+            _dispatch_local_memory(
+                "hasn.memory.update",
+                {
+                    "fact_id": fact_id,
+                    "object": mutation["content"],
+                    "rationale": rationale,
+                },
+            )
+        elif action == "remove":
+            _dispatch_local_memory(
+                "hasn.memory.withdraw",
+                {"fact_id": fact_id, "reason": "Hermes 原生 memory 工具删除条目"},
+            )
+
+
+def _active_memory_fact_observer() -> Optional[MemoryFactObserver]:
+    """返回当前应使用的观察者；纯 Hermes 模式不强制 hasn。"""
+    if _MEMORY_FACT_OBSERVER is not None:
+        return _MEMORY_FACT_OBSERVER
+
+    from gateway.hasn_session import get_hasn_session_id
+    from tools.mcp_tool import mcp_prefixed_tool_name
+    from tools.registry import registry
+
+    wrapper_name = mcp_prefixed_tool_name("hasn", "hasn.local.tool.call")
+    if registry.get_entry(wrapper_name) is not None or get_hasn_session_id() is not None:
+        return _default_memory_fact_observer
+    return None
 
 
 # Where memory files live — resolved dynamically so profile overrides
@@ -193,6 +348,7 @@ class MemoryStore:
         self.user_char_limit = user_char_limit
         # Frozen snapshot for system prompt -- set once at load_from_disk()
         self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": ""}
+        self._last_write_before: Dict[str, List[str]] = {"memory": [], "user": []}
         # Per-turn counter of failed at-capacity consolidation attempts; reset
         # at each turn boundary by reset_consolidation_failures() (#42405).
         self._consolidation_failures = 0
@@ -413,6 +569,7 @@ class MemoryStore:
             self._reload_target(target, skip_drift=True)
 
             entries = self._entries_for(target)
+            self._last_write_before[target] = list(entries)
             limit = self._char_limit(target)
 
             # Reject exact duplicates
@@ -464,6 +621,7 @@ class MemoryStore:
                 return _drift_error(self._path_for(target), bak)
 
             entries = self._entries_for(target)
+            self._last_write_before[target] = list(entries)
             matches = [(i, e) for i, e in enumerate(entries) if old_text in e]
 
             if not matches:
@@ -525,6 +683,7 @@ class MemoryStore:
                 return _drift_error(self._path_for(target), bak)
 
             entries = self._entries_for(target)
+            self._last_write_before[target] = list(entries)
             matches = [(i, e) for i, e in enumerate(entries) if old_text in e]
 
             if not matches:
@@ -586,6 +745,7 @@ class MemoryStore:
 
             # Work on a copy; only commit if the whole batch validates.
             working: List[str] = list(self._entries_for(target))
+            self._last_write_before[target] = list(working)
             limit = self._char_limit(target)
 
             for i, op in enumerate(operations):
@@ -1026,6 +1186,131 @@ def _missing_old_text_error(store: "MemoryStore", target: str, action: str) -> s
     )
 
 
+def _matched_entry(entries: List[str], old_text: str) -> str:
+    """按 MemoryStore 的子串规则取出本次操作的完整旧条目。"""
+    matches = [entry for entry in entries if old_text.strip() in entry]
+    if not matches:
+        raise RuntimeError(f"无法为已成功的记忆变更还原旧条目：{old_text}")
+    return matches[0]
+
+
+def _plan_single_memory_mutations(
+    action: str,
+    before: List[str],
+    content: Optional[str],
+    old_text: Optional[str],
+) -> List[MemoryFactMutation]:
+    """把单条 Markdown 操作转为结构化事实变更。"""
+    if action == "add":
+        return [{"action": "add", "content": (content or "").strip()}]
+    old_content = _matched_entry(before, old_text or "")
+    if action == "replace":
+        return [
+            {
+                "action": "replace",
+                "old_content": old_content,
+                "content": (content or "").strip(),
+            }
+        ]
+    if action == "remove":
+        return [{"action": "remove", "old_content": old_content}]
+    return []
+
+
+def _plan_batch_memory_mutations(
+    before: List[str],
+    operations: List[Dict[str, Any]],
+) -> List[MemoryFactMutation]:
+    """按批处理的顺序语义计算每一次结构化事实变更。"""
+    working = list(before)
+    mutations: List[MemoryFactMutation] = []
+    for operation in operations:
+        action = operation.get("action")
+        if action == "add":
+            content = str(operation.get("content") or "").strip()
+            mutations.append({"action": "add", "content": content})
+            if content not in working:
+                working.append(content)
+            continue
+
+        old_content = _matched_entry(working, str(operation.get("old_text") or ""))
+        index = working.index(old_content)
+        if action == "replace":
+            content = str(operation.get("content") or "").strip()
+            mutations.append(
+                {
+                    "action": "replace",
+                    "old_content": old_content,
+                    "content": content,
+                }
+            )
+            working[index] = content
+        elif action == "remove":
+            mutations.append({"action": "remove", "old_content": old_content})
+            working.pop(index)
+    return mutations
+
+
+def _restore_markdown_if_unchanged(
+    store: "MemoryStore",
+    target: str,
+    before: List[str],
+    expected_after: List[str],
+) -> bool:
+    """结构化同步失败时安全回滚 Markdown，不覆盖并发新写入。"""
+    path = store._path_for(target)
+    try:
+        with store._file_lock(path):
+            current = store._read_file(path)
+            if current != expected_after:
+                store._set_entries(target, current)
+                return False
+            store._set_entries(target, list(before))
+            store.save_to_disk(target)
+        return True
+    except Exception as exc:
+        logger.error("Markdown 记忆回滚失败：%s", exc)
+        return False
+
+
+def _sync_memory_fact_mutations(
+    store: "MemoryStore",
+    target: str,
+    before: List[str],
+    mutations: List[MemoryFactMutation],
+    result: Dict[str, Any],
+) -> Dict[str, Any]:
+    """同步结构化事实；失败时显式返错并尝试回滚 Markdown。"""
+    if not result.get("success") or not mutations:
+        return result
+    observer = _active_memory_fact_observer()
+    if observer is None:
+        return result
+
+    expected_after = list(store._entries_for(target))
+    try:
+        observer(target, mutations)
+        return result
+    except Exception as exc:
+        rolled_back = _restore_markdown_if_unchanged(
+            store,
+            target,
+            before,
+            expected_after,
+        )
+        logger.error("本地结构化记忆同步失败：%s", exc)
+        return {
+            "success": False,
+            "error": (
+                "Markdown 记忆已写入，但 hasn-node 结构化事实同步失败；"
+                "本次不能视为成功。请恢复本地 MCP 后重试。"
+            ),
+            "structured_memory_error": str(exc),
+            "markdown_rolled_back": rolled_back,
+            "reconciliation_required": not rolled_back or len(mutations) > 1,
+        }
+
+
 def memory_tool(
     action: str = None,
     target: str = "memory",
@@ -1064,6 +1349,16 @@ def memory_tool(
         if gate_result is not None:
             return gate_result
         result = store.apply_batch(target, operations)
+        if isinstance(result, dict) and result.get("success"):
+            before = list(store._last_write_before[target])
+            mutations = _plan_batch_memory_mutations(before, operations)
+            result = _sync_memory_fact_mutations(
+                store,
+                target,
+                before,
+                mutations,
+                result,
+            )
         return json.dumps(result, ensure_ascii=False)
 
     # --- Single-op path ---------------------------------------------------
@@ -1101,16 +1396,16 @@ def memory_tool(
     else:
         return tool_error(f"Unknown action '{action}'. Use: add, replace, remove", success=False)
 
-    # 唤星 B 路统一：USER.md（owner 维度）写入成功 → 把这条写入上传云端 contribute 管线
-    # （best-effort，去重由云端合并处理，故不传整份文件、只传本条写入）。remove 不易表达为
-    # 「观察」，故只上传 add/replace。MEMORY.md（agent 私有）不上传。
-    if (
-        target == "user"
-        and action in ("add", "replace")
-        and isinstance(result, dict)
-        and result.get("success")
-    ):
-        _notify_owner_memory_observation(content)
+    if isinstance(result, dict) and result.get("success"):
+        before = list(store._last_write_before[target])
+        mutations = _plan_single_memory_mutations(action, before, content, old_text)
+        result = _sync_memory_fact_mutations(
+            store,
+            target,
+            before,
+            mutations,
+            result,
+        )
 
     return json.dumps(result, ensure_ascii=False)
 
@@ -1131,18 +1426,35 @@ def apply_memory_pending(payload: Dict[str, Any], store: "MemoryStore") -> Dict[
     content = payload.get("content") or ""
     old_text = payload.get("old_text") or ""
     if action == "batch":
-        return store.apply_batch(target, payload.get("operations") or [])
+        operations = payload.get("operations") or []
+        result = store.apply_batch(target, operations)
+        if isinstance(result, dict) and result.get("success"):
+            before = list(store._last_write_before[target])
+            result = _sync_memory_fact_mutations(
+                store,
+                target,
+                before,
+                _plan_batch_memory_mutations(before, operations),
+                result,
+            )
+        return result
     if action == "add":
         result = store.add(target, content)
     elif action == "replace":
         result = store.replace(target, old_text, content)
     elif action == "remove":
-        return store.remove(target, old_text)
+        result = store.remove(target, old_text)
     else:
         return {"success": False, "error": f"Unknown staged action '{action}'."}
-    # 唤星 B 路统一：gated（审批后回放）路径同样把 USER.md 写入上传云端 contribute（best-effort）。
-    if target == "user" and isinstance(result, dict) and result.get("success"):
-        _notify_owner_memory_observation(content)
+    if isinstance(result, dict) and result.get("success"):
+        before = list(store._last_write_before[target])
+        result = _sync_memory_fact_mutations(
+            store,
+            target,
+            before,
+            _plan_single_memory_mutations(action, before, content, old_text),
+            result,
+        )
     return result
 # OpenAI Function-Calling Schema
 # =============================================================================
@@ -1232,7 +1544,3 @@ registry.register(
     check_fn=check_memory_requirements,
     emoji="🧠",
 )
-
-
-
-

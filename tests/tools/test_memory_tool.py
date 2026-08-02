@@ -918,12 +918,12 @@ class TestLoadTimeSnapshotSanitization:
 
 
 # =========================================================================
-# 唤星 B 路统一：USER.md 写入 → 云端 contribute 观察者钩子
+# 唤星写入单源：Hermes 原生 Markdown 写入 → 本地结构化事实
 # =========================================================================
 
 import pytest as _pytest  # noqa: E402
 
-from tools.memory_tool import set_owner_memory_observer  # noqa: E402
+from tools.memory_tool import apply_memory_pending, set_memory_fact_observer  # noqa: E402
 
 
 @_pytest.fixture
@@ -934,86 +934,401 @@ def user_store(tmp_path, monkeypatch):
     return s
 
 
-class TestOwnerMemoryObserver:
-    def test_user_add_triggers_contribution(self, user_store):
+class TestMemoryFactObserver:
+    def test_default_observer_calls_local_memory_save(self, user_store, monkeypatch):
+        from tools.mcp_tool import mcp_prefixed_tool_name
+        from tools.registry import registry
+
         captured = []
-        set_owner_memory_observer(lambda content: captured.append(content))
+        wrapper_name = mcp_prefixed_tool_name("hasn", "hasn.local.tool.call")
+        monkeypatch.setattr(registry, "get_entry", lambda name: object() if name == wrapper_name else None)
+        def _dispatch(name, params):
+            captured.append((name, params))
+            if params["name"] == "hasn.memory.list":
+                return '{"result":"{\\"facts\\":[]}"}'
+            return '{"result":"{\\"saved\\":true}"}'
+
+        monkeypatch.setattr(registry, "dispatch", _dispatch)
+        set_memory_fact_observer(None)
+
+        result = json.loads(
+            memory_tool(action="add", target="user", content="主人偏好简洁直接的沟通", store=user_store)
+        )
+
+        assert result["success"] is True
+        assert [params["name"] for _, params in captured] == [
+            "hasn.memory.list",
+            "hasn.memory.save",
+        ]
+        assert captured[0] == (
+            wrapper_name,
+            {
+                "name": "hasn.memory.list",
+                "params": {
+                    "subject_kind": "owner",
+                    "predicate": "Hermes 原生记忆",
+                    "object": "主人偏好简洁直接的沟通",
+                    "editable_only": True,
+                    "limit": 2,
+                },
+            },
+        )
+        assert captured[1][1]["params"] == {
+            "subject_kind": "owner",
+            "predicate": "Hermes 原生记忆",
+            "object": "主人偏好简洁直接的沟通",
+            "rationale": "由 Hermes 原生 memory 工具写入 user",
+        }
+
+    def test_default_observer_replaces_existing_fact(self, user_store, monkeypatch):
+        from tools.mcp_tool import mcp_prefixed_tool_name
+        from tools.registry import registry
+
+        user_store.add("memory", "旧项目约定")
+        calls = []
+        wrapper_name = mcp_prefixed_tool_name("hasn", "hasn.local.tool.call")
+        monkeypatch.setattr(
+            registry,
+            "get_entry",
+            lambda name: object() if name == wrapper_name else None,
+        )
+
+        def _dispatch(name, params):
+            calls.append((name, params))
+            if params["name"] == "hasn.memory.list":
+                return {
+                    "result": {
+                        "facts": [
+                            {
+                                "fact_id": "fact-old",
+                                "predicate": "Hermes 原生记忆",
+                                "object": "旧项目约定",
+                                "editable": True,
+                                "status": "active",
+                            }
+                        ]
+                    }
+                }
+            return {"result": {"fact": {"fact_id": "fact-old"}}}
+
+        monkeypatch.setattr(registry, "dispatch", _dispatch)
+        set_memory_fact_observer(None)
+
+        result = json.loads(
+            memory_tool(
+                action="replace",
+                target="memory",
+                old_text="旧项目",
+                content="新项目约定",
+                store=user_store,
+            )
+        )
+
+        assert result["success"] is True
+        assert [params["name"] for _, params in calls] == [
+            "hasn.memory.list",
+            "hasn.memory.list",
+            "hasn.memory.update",
+        ]
+        assert calls[0][1]["params"]["object"] == "新项目约定"
+        assert calls[1][1]["params"]["object"] == "旧项目约定"
+        assert all(
+            call[1]["params"].get("predicate") == "Hermes 原生记忆"
+            for call in calls[:2]
+        )
+        assert all(
+            call[1]["params"].get("editable_only") is True
+            for call in calls[:2]
+        )
+        assert calls[-1][1]["params"] == {
+            "fact_id": "fact-old",
+            "object": "新项目约定",
+            "rationale": "由 Hermes 原生 memory 工具写入 memory",
+        }
+
+    def test_default_observer_withdraws_removed_fact(self, user_store, monkeypatch):
+        from tools.mcp_tool import mcp_prefixed_tool_name
+        from tools.registry import registry
+
+        user_store.add("user", "主人喜欢登山")
+        calls = []
+        wrapper_name = mcp_prefixed_tool_name("hasn", "hasn.local.tool.call")
+        monkeypatch.setattr(
+            registry,
+            "get_entry",
+            lambda name: object() if name == wrapper_name else None,
+        )
+
+        def _dispatch(name, params):
+            calls.append((name, params))
+            if params["name"] == "hasn.memory.list":
+                return {
+                    "result": {
+                        "facts": [
+                            {
+                                "fact_id": "fact-hiking",
+                                "predicate": "Hermes 原生记忆",
+                                "object": "主人喜欢登山",
+                                "editable": True,
+                                "status": "active",
+                            }
+                        ]
+                    }
+                }
+            return {"result": {"fact": {"fact_id": "fact-hiking"}}}
+
+        monkeypatch.setattr(registry, "dispatch", _dispatch)
+        set_memory_fact_observer(None)
+
+        result = json.loads(
+            memory_tool(
+                action="remove",
+                target="user",
+                old_text="登山",
+                store=user_store,
+            )
+        )
+
+        assert result["success"] is True
+        assert [params["name"] for _, params in calls] == [
+            "hasn.memory.list",
+            "hasn.memory.withdraw",
+        ]
+        assert calls[0][1]["params"]["include_status"] == ["active", "withdrawn"]
+        assert calls[0][1]["params"]["predicate"] == "Hermes 原生记忆"
+        assert calls[0][1]["params"]["object"] == "主人喜欢登山"
+        assert calls[0][1]["params"]["limit"] == 2
+        assert calls[-1][1]["params"] == {
+            "fact_id": "fact-hiking",
+            "reason": "Hermes 原生 memory 工具删除条目",
+        }
+
+    def test_hasn_session_missing_local_wrapper_fails_and_rolls_back(
+        self, user_store, monkeypatch
+    ):
+        from gateway.hasn_session import reset_hasn_session_id, set_hasn_session_id
+        from tools.registry import registry
+
+        monkeypatch.setattr(registry, "get_entry", lambda _name: None)
+        set_memory_fact_observer(None)
+        token = set_hasn_session_id("session-1")
+        try:
+            result = json.loads(
+                memory_tool(
+                    action="add",
+                    target="memory",
+                    content="项目使用 PostgreSQL",
+                    store=user_store,
+                )
+            )
+            assert result["success"] is False
+            assert result["markdown_rolled_back"] is True
+            assert "hasn 本地 MCP 未连接" in result["structured_memory_error"]
+            assert user_store.memory_entries == []
+        finally:
+            reset_hasn_session_id(token)
+
+    def test_user_add_saves_owner_fact(self, user_store):
+        captured = []
+        set_memory_fact_observer(
+            lambda target, mutations: captured.append((target, mutations))
+        )
         try:
             result = json.loads(
                 memory_tool(action="add", target="user", content="主人偏好简洁直接的沟通", store=user_store)
             )
             assert result["success"] is True
-            assert captured == ["主人偏好简洁直接的沟通"]
+            assert captured == [
+                (
+                    "user",
+                    [{"action": "add", "content": "主人偏好简洁直接的沟通"}],
+                )
+            ]
         finally:
-            set_owner_memory_observer(None)
+            set_memory_fact_observer(None)
 
-    def test_user_replace_triggers_contribution_with_new_content(self, user_store):
+    def test_user_replace_saves_owner_fact_with_new_content(self, user_store):
         user_store.add("user", "主人住在昆明")
         captured = []
-        set_owner_memory_observer(lambda content: captured.append(content))
+        set_memory_fact_observer(
+            lambda target, mutations: captured.append((target, mutations))
+        )
         try:
             result = json.loads(
                 memory_tool(action="replace", target="user", old_text="昆明", content="主人住在昆明五华区", store=user_store)
             )
             assert result["success"] is True
-            assert captured == ["主人住在昆明五华区"]
+            assert captured == [
+                (
+                    "user",
+                    [
+                        {
+                            "action": "replace",
+                            "old_content": "主人住在昆明",
+                            "content": "主人住在昆明五华区",
+                        }
+                    ],
+                )
+            ]
         finally:
-            set_owner_memory_observer(None)
+            set_memory_fact_observer(None)
 
-    def test_memory_target_does_not_trigger_contribution(self, user_store):
+    def test_replace_uses_entry_reloaded_under_file_lock(self, user_store):
+        # 姐妹会话在当前 store 启动后落盘，本次 replace 必须以锁内重读的
+        # 完整旧条目生成结构化变更，不能使用启动时的过期内存快照。
+        user_store._path_for("user").write_text("主人住在杭州", encoding="utf-8")
         captured = []
-        set_owner_memory_observer(lambda content: captured.append(content))
+        set_memory_fact_observer(
+            lambda target, mutations: captured.append((target, mutations))
+        )
+        try:
+            result = json.loads(
+                memory_tool(
+                    action="replace",
+                    target="user",
+                    old_text="杭州",
+                    content="主人住在杭州西湖区",
+                    store=user_store,
+                )
+            )
+            assert result["success"] is True
+            assert captured == [
+                (
+                    "user",
+                    [
+                        {
+                            "action": "replace",
+                            "old_content": "主人住在杭州",
+                            "content": "主人住在杭州西湖区",
+                        }
+                    ],
+                )
+            ]
+        finally:
+            set_memory_fact_observer(None)
+
+    def test_memory_target_saves_agent_self_fact(self, user_store):
+        captured = []
+        set_memory_fact_observer(
+            lambda target, mutations: captured.append((target, mutations))
+        )
         try:
             result = json.loads(
                 memory_tool(action="add", target="memory", content="项目用 PostgreSQL", store=user_store)
             )
             assert result["success"] is True
-            assert captured == []  # MEMORY.md 是 agent 私有，不上传
+            assert captured == [
+                ("memory", [{"action": "add", "content": "项目用 PostgreSQL"}])
+            ]
         finally:
-            set_owner_memory_observer(None)
+            set_memory_fact_observer(None)
 
-    def test_user_remove_does_not_trigger_contribution(self, user_store):
+    def test_batch_syncs_replace_add_and_remove_in_order(self, user_store):
+        user_store.add("memory", "旧约定")
+        captured = []
+        set_memory_fact_observer(
+            lambda target, mutations: captured.append((target, mutations))
+        )
+        try:
+            result = json.loads(
+                memory_tool(
+                    target="memory",
+                    operations=[
+                        {"action": "replace", "old_text": "旧约定", "content": "新约定"},
+                        {"action": "add", "content": "临时条目"},
+                        {"action": "remove", "old_text": "临时条目"},
+                    ],
+                    store=user_store,
+                )
+            )
+            assert result["success"] is True
+            assert captured == [
+                (
+                    "memory",
+                    [
+                        {
+                            "action": "replace",
+                            "old_content": "旧约定",
+                            "content": "新约定",
+                        },
+                        {"action": "add", "content": "临时条目"},
+                        {"action": "remove", "old_content": "临时条目"},
+                    ],
+                )
+            ]
+        finally:
+            set_memory_fact_observer(None)
+
+    def test_user_remove_withdraws_structured_fact(self, user_store):
         user_store.add("user", "主人喜欢登山")
         captured = []
-        set_owner_memory_observer(lambda content: captured.append(content))
+        set_memory_fact_observer(
+            lambda target, mutations: captured.append((target, mutations))
+        )
         try:
             result = json.loads(
                 memory_tool(action="remove", target="user", old_text="登山", store=user_store)
             )
             assert result["success"] is True
-            assert captured == []  # remove 不表达为「观察」，不上传
+            assert captured == [
+                (
+                    "user",
+                    [{"action": "remove", "old_content": "主人喜欢登山"}],
+                )
+            ]
         finally:
-            set_owner_memory_observer(None)
+            set_memory_fact_observer(None)
 
     def test_failed_user_add_does_not_trigger_contribution(self, user_store):
         # 先填满 USER.md（user_char_limit=300），再 add 超限 → 写入失败，不应上传
         user_store.add("user", "x" * 290)
         captured = []
-        set_owner_memory_observer(lambda content: captured.append(content))
+        set_memory_fact_observer(
+            lambda target, mutations: captured.append((target, mutations))
+        )
         try:
             result = json.loads(
                 memory_tool(action="add", target="user", content="y" * 100, store=user_store)
             )
             assert result["success"] is False
-            assert captured == []  # 写入失败不上传
+            assert captured == []  # Markdown 写入失败就不写事实
         finally:
-            set_owner_memory_observer(None)
+            set_memory_fact_observer(None)
 
-    def test_observer_exception_does_not_break_write(self, user_store):
-        def _boom(content):
-            raise RuntimeError("simulated host endpoint down")
+    def test_observer_exception_fails_write_and_rolls_back_markdown(self, user_store):
+        def _boom(target, mutations):
+            raise RuntimeError("simulated local memory tool down")
 
-        set_owner_memory_observer(_boom)
+        set_memory_fact_observer(_boom)
         try:
-            # 观察者抛错被吞，本地写入仍成功返回
             result = json.loads(
                 memory_tool(action="add", target="user", content="主人是后端工程师", store=user_store)
             )
-            assert result["success"] is True
-            # 断言「写入真的落地」而非回显字段——上游会改返回结构（曾用 entries，
-            # 现为 entry_count/usage），断言活状态+落盘才是这条测试的本意，
-            # 也不会被上游下一次改返回体带红。
-            assert "主人是后端工程师" in user_store.user_entries
-            assert "主人是后端工程师" in (user_store._path_for("user")).read_text()
+            assert result["success"] is False
+            assert result["markdown_rolled_back"] is True
+            assert "simulated local memory tool down" in result["structured_memory_error"]
+            assert "主人是后端工程师" not in user_store.user_entries
+            assert "主人是后端工程师" not in user_store._path_for("user").read_text()
         finally:
-            set_owner_memory_observer(None)
+            set_memory_fact_observer(None)
+
+    def test_approved_batch_uses_same_structured_mutations(self, user_store):
+        captured = []
+        set_memory_fact_observer(
+            lambda target, mutations: captured.append((target, mutations))
+        )
+        try:
+            result = apply_memory_pending(
+                {
+                    "action": "batch",
+                    "target": "memory",
+                    "operations": [{"action": "add", "content": "审批后写入"}],
+                },
+                user_store,
+            )
+            assert result["success"] is True
+            assert captured == [
+                ("memory", [{"action": "add", "content": "审批后写入"}])
+            ]
+        finally:
+            set_memory_fact_observer(None)
