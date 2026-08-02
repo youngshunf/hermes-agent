@@ -1,9 +1,9 @@
-"""Tests for BaseEnvironment unified execution model.
+"""BaseEnvironment 统一执行模型测试。
 
-Tests _wrap_command(), _extract_cwd_from_output(), _embed_stdin_heredoc(),
-init_session() failure handling, and the CWD marker contract.
+覆盖命令包装、cwd 提取、stdin 嵌入、init_session 降级和 cwd 标记契约。
 """
 
+import logging
 from unittest.mock import MagicMock
 
 from tools.environments.base import BaseEnvironment, _BoundedOutputCollector
@@ -150,34 +150,24 @@ class TestAtomicSnapshotWrite:
         assert f"export -p > {snap} " not in wrapped
         assert f"export -p > '{snap}'" not in wrapped
 
-    def test_temp_path_uses_bashpid_not_dollardollar(self):
-        """The temp name MUST use ``$BASHPID`` (the real subshell PID), not
-        ``$$``.  In ``&``-launched concurrent subshells ``$$`` stays the parent
-        shell's PID, so two writers would pick the same temp name, clobber each
-        other mid-write, and mv would publish a torn file — the corruption is
-        only narrowed, not closed.  This is the bug shared by every prior PR in
-        the #38249 cluster."""
+    def test_temp_path_uses_mktemp_not_shell_pid_variables(self):
+        """临时文件名必须由 ``mktemp`` 生成，兼容没有 ``BASHPID`` 的 Bash 3.2。"""
         env = _TestableEnv()
         env._snapshot_ready = True
         wrapped = env._wrap_command("echo hi", "/tmp")
-        assert "$BASHPID" in wrapped
-        # The bare $$ temp form must be gone.
+        assert "mktemp " in wrapped
+        assert ".tmp.XXXXXX" in wrapped
+        assert "$BASHPID" not in wrapped
         assert ".tmp.$$" not in wrapped
 
-    def test_temp_path_static_part_is_quoted_bashpid_outside(self):
-        """The static path portion must be shlex-quoted (Windows/Git-Bash
-        ``C:/Users/...`` or spaces) while ``$BASHPID`` stays OUTSIDE the quotes
-        so it still expands."""
+    def test_temp_path_template_is_quoted_for_spaces(self):
+        """带空格的临时文件模板必须作为一个参数传给 ``mktemp``。"""
         env = _TestableEnv()
         env._snapshot_ready = True
         env._snapshot_path = "/tmp/has space/hermes-snap-x.sh"
         wrapped = env._wrap_command("echo hi", "/tmp")
-        # The static path (with its space) is shlex-quoted as a single word, with
-        # $BASHPID appended OUTSIDE the quotes so it still expands at runtime.
-        assert "'/tmp/has space/hermes-snap-x.sh.tmp.'$BASHPID" in wrapped
-        # The space must never appear bare/unquoted in the temp token (that would
-        # word-split into two args and break the redirect/mv).
-        assert " space/hermes-snap-x.sh.tmp.$BASHPID" not in wrapped
+        assert "mktemp '/tmp/has space/hermes-snap-x.sh.tmp.XXXXXX'" in wrapped
+        assert "mktemp /tmp/has space/hermes-snap-x.sh.tmp.XXXXXX" not in wrapped
 
     def test_wrap_command_mv_chained_on_export_success(self):
         """A failed/partial ``export -p`` must NOT mv a torn temp over a good
@@ -189,10 +179,8 @@ class TestAtomicSnapshotWrite:
         assert "export -p > " in wrapped and "&& mv -f " in wrapped
         assert "rm -f " in wrapped  # temp cleanup on failure
 
-    def test_init_session_bootstrap_also_atomic_and_bashpid(self):
-        """The init_session bootstrap (first snapshot write) is the same shared
-        file a concurrent command could source — it must be atomic and use
-        ``$BASHPID`` too."""
+    def test_init_session_bootstrap_also_atomic_and_uses_mktemp(self):
+        """首次快照写入也必须用 ``mktemp`` 和原子替换。"""
         env = _TestableEnv()
         captured = {}
 
@@ -207,7 +195,9 @@ class TestAtomicSnapshotWrite:
             pass
         boot = captured.get("cmd", "")
         assert ".tmp." in boot and "mv -f " in boot, boot
-        assert "$BASHPID" in boot
+        assert "mktemp " in boot
+        assert ".tmp.XXXXXX" in boot
+        assert "$BASHPID" not in boot
         assert ".tmp.$$" not in boot
 
     def test_snapshot_writes_use_private_umask_after_user_command(self):
@@ -241,12 +231,8 @@ class TestAtomicSnapshotConcurrencyBehavioral:
     """Behavioral regression for #38249 — actually EXECUTES the generated
     snapshot write/read concurrently and asserts the file never tears.
 
-    The string-inspection tests prove the right script is emitted; this proves
-    the emitted script's guarantee holds under real concurrency: N concurrent
-    writers + readers, and the snapshot is ALWAYS a complete, parseable env
-    dump — never truncated mid-line with a ``declare -x`` / ``export`` fragment
-    that would corrupt PATH.  Crucially it uses ``$BASHPID`` (per-subshell
-    unique), which is what closes the race; ``$$`` would still tear here.
+    字符串检查证明生成脚本使用正确协议；本测试用真实并发读写证明快照始终完整。
+    临时文件由 ``mktemp`` 生成，避免 Bash 3.2 缺少 ``BASHPID`` 时所有写者撞名。
     """
 
     def _run(self, script):
@@ -261,13 +247,16 @@ class TestAtomicSnapshotConcurrencyBehavioral:
         import shlex
         snap = str(tmp_path / "hermes-snap-x.sh")
         _q = shlex.quote
-        _snap_tmp = _q(snap + ".tmp.") + "$BASHPID"
+        _snap_tmp_template = _q(snap + ".tmp.XXXXXX")
         # One writer iteration = the exact atomic sequence _wrap_command emits.
         writer = (
             "for i in $(seq 1 80); do "
             "export BIG_$i=$(head -c 600 /dev/zero | tr '\\0' x); "
-            f"{{ export -p > {_snap_tmp} && mv -f {_snap_tmp} {_q(snap)}; }} "
-            f"2>/dev/null || rm -f {_snap_tmp} 2>/dev/null || true; "
+            f"{{ __hermes_snap_tmp=$(mktemp {_snap_tmp_template}) && "
+            f"export -p > \"$__hermes_snap_tmp\" && "
+            f"mv -f \"$__hermes_snap_tmp\" {_q(snap)}; }} 2>/dev/null || "
+            "{ [ -z \"${__hermes_snap_tmp:-}\" ] || "
+            "rm -f \"$__hermes_snap_tmp\" 2>/dev/null; true; }; "
             "done"
         )
         # Reader: repeatedly source the snapshot and check PATH never absorbs
@@ -375,6 +364,7 @@ class TestExtractCwdFromOutput:
         env._extract_cwd_from_output(result)
 
         assert env.cwd == "/home/user"
+        assert result["_cwd"] == "/home/user"
         assert marker not in result["output"]
 
     def test_missing_marker(self):
@@ -427,6 +417,41 @@ class TestEmbedStdinHeredoc:
 
 
 class TestInitSessionFailure:
+    def test_init_session_logs_do_not_expose_cwd(self, caplog):
+        """成功与失败日志都不得包含项目工作目录。"""
+        private_cwd = "/Users/owner/private-project"
+        env = _TestableEnv(cwd=private_cwd)
+        marker = env._cwd_marker
+
+        env._run_bash = MagicMock()
+        env._wait_for_process = MagicMock(
+            return_value={
+                "returncode": 0,
+                "stdout": f"{marker}{private_cwd}{marker}",
+            }
+        )
+
+        with caplog.at_level(logging.INFO, logger="tools.environments.base"):
+            env.init_session()
+
+        assert env._snapshot_ready is True
+        assert "Session snapshot created" in caplog.text
+        assert private_cwd not in caplog.text
+
+        caplog.clear()
+        failing_env = _TestableEnv(cwd=private_cwd)
+
+        def failing_run_bash(*args, **kwargs):
+            raise RuntimeError(f"无法进入 {private_cwd}")
+
+        failing_env._run_bash = failing_run_bash
+        with caplog.at_level(logging.WARNING, logger="tools.environments.base"):
+            failing_env.init_session()
+
+        assert failing_env._snapshot_ready is False
+        assert "init_session failed" in caplog.text
+        assert private_cwd not in caplog.text
+
     def test_snapshot_ready_false_on_failure(self):
         env = _TestableEnv()
 

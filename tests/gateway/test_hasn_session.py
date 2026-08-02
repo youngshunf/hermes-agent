@@ -18,18 +18,23 @@ from gateway.hasn_session import (
     HASN_STAMPED_MCP_SERVERS,
     RESERVED_PROJECT_ARG,
     RESERVED_SESSION_ARG,
+    RESERVED_WORKING_DIRECTORY_ARG,
     RESERVED_WORK_SESSION_ARG,
     get_hasn_project_id,
     get_hasn_session_id,
+    get_hasn_working_directory,
     get_hasn_work_session_id,
     reset_hasn_project_id,
     reset_hasn_session_id,
+    reset_hasn_working_directory,
     reset_hasn_work_session_id,
     set_hasn_project_id,
     set_hasn_session_id,
+    set_hasn_working_directory,
     set_hasn_work_session_id,
     stamp_project_arg,
     stamp_session_arg,
+    stamp_working_directory_arg,
     stamp_work_session_arg,
 )
 
@@ -242,6 +247,48 @@ def test_project_stamp_alone_when_no_session():
         assert args[RESERVED_PROJECT_ARG] == "proj-only"
     finally:
         reset_hasn_project_id(p_token)
+
+
+# ── 本机工作目录轨（仅本地 hasn MCP，绝不发往云端）──────────────────────────
+
+
+def test_working_directory_reserved_arg_matches_rust_contract():
+    assert RESERVED_WORKING_DIRECTORY_ARG == "_hasn_working_directory"
+
+
+def test_working_directory_set_get_reset_roundtrip(tmp_path):
+    token = set_hasn_working_directory(str(tmp_path))
+    assert get_hasn_working_directory() == str(tmp_path)
+    reset_hasn_working_directory(token)
+    assert get_hasn_working_directory() is None
+
+
+def test_working_directory_only_stamps_local_hasn(tmp_path):
+    token = set_hasn_working_directory(str(tmp_path))
+    try:
+        local_args = stamp_working_directory_arg("hasn", {"path": "报告.md"})
+        assert local_args[RESERVED_WORKING_DIRECTORY_ARG] == str(tmp_path)
+
+        cloud_args = stamp_working_directory_arg(
+            "cloud",
+            {RESERVED_WORKING_DIRECTORY_ARG: str(tmp_path), "title": "报告"},
+        )
+        assert RESERVED_WORKING_DIRECTORY_ARG not in cloud_args
+        assert cloud_args["title"] == "报告"
+
+        third_party = {"path": "报告.md"}
+        assert stamp_working_directory_arg("filesystem", third_party) is third_party
+    finally:
+        reset_hasn_working_directory(token)
+
+
+def test_working_directory_stamp_strips_untrusted_value_without_context():
+    args = stamp_working_directory_arg(
+        "hasn",
+        {RESERVED_WORKING_DIRECTORY_ARG: "/tmp/伪造目录", "path": "报告.md"},
+    )
+    assert RESERVED_WORKING_DIRECTORY_ARG not in args
+    assert args["path"] == "报告.md"
 
 
 # ── 工作会话轨（设计 02 §4.3 会话轴分流）────────────────────────────────────

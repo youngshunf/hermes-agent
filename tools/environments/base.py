@@ -486,19 +486,16 @@ class BaseEnvironment(ABC):
         # source() either sees the old complete snapshot or the new complete
         # one — never a partial/truncated file.
         #
-        # The temp name MUST be unique per concurrent writer.  ``$$`` is the
-        # bash PID, but in ``&``-launched subshells (how concurrent terminal
-        # calls run) ``$$`` stays the *parent* shell's PID — so two concurrent
-        # writers would pick the SAME temp name, clobber each other's temp
-        # mid-write, and mv would then publish a torn file (the corruption is
-        # only narrowed, not closed).  ``$BASHPID`` is the actual subshell PID
-        # and is genuinely unique per writer, which closes the race.  The
-        # static path is shell-quoted (Windows/Git-Bash drive letters, spaces)
-        # with ``$BASHPID`` left outside the quotes so it still expands.
-        _snap_tmp = self._quote_shell_path(self._snapshot_path + ".tmp.") + "$BASHPID"
+        # 并发写者必须各自持有临时文件。macOS 自带 Bash 3.2 没有
+        # ``BASHPID``，所以不能依赖 shell PID 变量；让 ``mktemp`` 在快照
+        # 同目录生成唯一文件，同时保持后续 ``mv`` 的同文件系统原子替换。
+        _snap_tmp_template = self._quote_shell_path(
+            self._snapshot_path + ".tmp.XXXXXX"
+        )
         bootstrap = (
             f"umask 077\n"
-            f"export -p > {_snap_tmp}\n"
+            f"__hermes_snap_tmp=$(mktemp {_snap_tmp_template}) || exit 1\n"
+            f"export -p > \"$__hermes_snap_tmp\"\n"
             # Dump function definitions, filtering out private (``_``-prefixed)
             # helpers — mainly bash-completion internals (``_git``, ``_make``…)
             # — by NAME, not by line.  A naive ``declare -f | grep -vE '^_[^_]'``
@@ -513,14 +510,15 @@ class BaseEnvironment(ABC):
             # very functions we meant to drop.
             f"__hermes_fns=$(declare -F | awk '{{print $3}}' | grep -vE '^_[^_]') || true\n"
             f"[ -n \"$__hermes_fns\" ] && declare -f $__hermes_fns "
-            f">> {_snap_tmp} 2>/dev/null || true\n"
-            f"alias -p >> {_snap_tmp}\n"
-            f"echo 'shopt -s expand_aliases' >> {_snap_tmp}\n"
-            f"echo 'set +e' >> {_snap_tmp}\n"
-            f"echo 'set +u' >> {_snap_tmp}\n"
+            f">> \"$__hermes_snap_tmp\" 2>/dev/null || true\n"
+            f"alias -p >> \"$__hermes_snap_tmp\"\n"
+            f"echo 'shopt -s expand_aliases' >> \"$__hermes_snap_tmp\"\n"
+            f"echo 'set +e' >> \"$__hermes_snap_tmp\"\n"
+            f"echo 'set +u' >> \"$__hermes_snap_tmp\"\n"
             # Publish atomically only if assembly succeeded; otherwise drop the
             # partial temp rather than leave it to be sourced or orphaned.
-            f"mv -f {_snap_tmp} {_quoted_snap} || rm -f {_snap_tmp}\n"
+            f"mv -f \"$__hermes_snap_tmp\" {_quoted_snap} || "
+            f"{{ rm -f \"$__hermes_snap_tmp\"; exit 1; }}\n"
             f"builtin cd -- {_quoted_cwd} 2>/dev/null || true\n"
             f"printf '\\n{self._cwd_marker}%s{self._cwd_marker}\\n' \"$(pwd -P)\"\n"
         )
@@ -533,42 +531,38 @@ class BaseEnvironment(ABC):
                 )
             self._snapshot_ready = True
             self._update_cwd(result)
-            logger.info(
-                "Session snapshot created (session=%s, cwd=%s)",
-                self._session_id,
-                self.cwd,
-            )
+            # 工作目录属于项目私有信息；普通日志只记录会话结果，不写入路径值。
+            logger.info("Session snapshot created (session=%s)", self._session_id)
         except Exception as exc:
             self._snapshot_ready = False
             # Default fallback is bash -l per command so PATH/nvm/etc still
             # load.  If login itself is dead (classic Windows Git Bash
             # ``Directory \\drivers\\etc does not exist``), that fallback
             # would brick every tool — prefer non-login bash -c instead.
-            detail = str(exc)
+            # 异常文本可能包含失败的 cd 目标或 shell 输出，因此日志只保留异常类型。
+            failure_type = type(exc).__name__
             prefer_nonlogin = False
             try:
                 probe = self._run_bash("true", login=False, timeout=min(15, self._snapshot_timeout))
                 probe_result = self._wait_for_process(probe, timeout=min(15, self._snapshot_timeout))
                 prefer_nonlogin = int(probe_result.get("returncode") or 0) == 0
-                if not prefer_nonlogin:
-                    detail = (probe_result.get("stdout") or detail).strip() or detail
             except Exception as probe_exc:
-                detail = f"{detail}; non-login probe: {probe_exc}"
+                failure_type = f"{failure_type}/{type(probe_exc).__name__}"
 
             self._prefer_nonlogin = prefer_nonlogin
             if prefer_nonlogin:
                 logger.warning(
-                    "init_session failed (session=%s): %s — "
+                    "init_session failed (session=%s, cause=%s) — "
                     "login bash unusable; falling back to non-login bash -c",
                     self._session_id,
-                    exc,
+                    failure_type,
                 )
             else:
                 logger.warning(
-                    "init_session failed (session=%s): %s — "
+                    "init_session failed (session=%s, cause=%s) — "
                     "falling back to bash -l per command",
                     self._session_id,
-                    detail,
+                    failure_type,
                 )
 
     # ------------------------------------------------------------------
@@ -603,14 +597,11 @@ class BaseEnvironment(ABC):
         # Quote the snapshot path (see init_session — LocalEnvironment
         # rewrites ``C:/...`` to ``/c/...`` so MSYS doesn't mangle it).
         _quoted_snap = self._quote_shell_path(self._snapshot_path)
-        # Use atomic file replacement for env snapshot updates (issue #38249).
-        # Assemble into a per-writer-unique temp file, then mv to atomically
-        # replace the snapshot so concurrent source() calls never read a
-        # truncated/half-written file.  ``$BASHPID`` (not ``$$``) is the actual
-        # subshell PID — unique per concurrent ``&``-launched writer — so two
-        # writers never share a temp name and clobber each other before the mv.
-        # Static path shell-quoted (Windows/spaces); ``$BASHPID`` left to expand.
-        _snap_tmp = self._quote_shell_path(self._snapshot_path + ".tmp.") + "$BASHPID"
+        # 用同目录 ``mktemp`` 文件组装快照，再原子替换正式文件。这样既兼容
+        # Bash 3.2，也能保证并发写者不会共享临时文件。
+        _snap_tmp_template = self._quote_shell_path(
+            self._snapshot_path + ".tmp.XXXXXX"
+        )
 
         parts = []
 
@@ -644,8 +635,11 @@ class BaseEnvironment(ABC):
         # orphaned (cleaned up wholesale in LocalEnvironment.cleanup too).
         if self._snapshot_ready:
             parts.append(
-                f"{{ export -p > {_snap_tmp} && mv -f {_snap_tmp} {_quoted_snap}; }} "
-                f"2>/dev/null || rm -f {_snap_tmp} 2>/dev/null || true"
+                f"{{ __hermes_snap_tmp=$(mktemp {_snap_tmp_template}) && "
+                f"export -p > \"$__hermes_snap_tmp\" && "
+                f"mv -f \"$__hermes_snap_tmp\" {_quoted_snap}; }} 2>/dev/null || "
+                f"{{ [ -z \"${{__hermes_snap_tmp:-}}\" ] || "
+                f"rm -f \"$__hermes_snap_tmp\" 2>/dev/null; true; }}"
             )
 
         # Emit the CWD stdout marker; all backends (including local, since
@@ -1011,6 +1005,9 @@ class BaseEnvironment(ABC):
         cwd_path = output[first + len(marker) : last].strip()
         if cwd_path:
             self.cwd = cwd_path
+            # 把本次执行解析出的目录留在结果中，调用方无需再读取可被并发覆盖的
+            # ``self.cwd``。
+            result["_cwd"] = cwd_path
 
         # Strip the marker line AND the \n we injected before it.
         # The wrapper emits: printf '\n__MARKER__%s__MARKER__\n'

@@ -134,6 +134,21 @@ except Exception:  # pragma: no cover - gateway 不可导入的进程（CLI/cron
 
 try:
     from gateway.hasn_session import (
+        HASN_STAMPED_MCP_SERVERS as _HASN_STAMPED_MCP_SERVERS,
+        RESERVED_CONTEXT_CAPABILITY_ARG as _RESERVED_CONTEXT_CAPABILITY_ARG,
+        RESERVED_WORKING_DIRECTORY_ARG as _RESERVED_WORKING_DIRECTORY_ARG,
+        stamp_context_capability_arg as _stamp_hasn_context_capability_arg,
+        stamp_working_directory_arg as _stamp_hasn_working_directory_arg,
+    )
+except Exception:  # pragma: no cover - gateway 不可导入的进程（CLI/cron）
+    _HASN_STAMPED_MCP_SERVERS = frozenset({"hasn", "cloud"})
+    _RESERVED_CONTEXT_CAPABILITY_ARG = "_hasn_context_capability"
+    _RESERVED_WORKING_DIRECTORY_ARG = "_hasn_working_directory"
+    _stamp_hasn_context_capability_arg = None
+    _stamp_hasn_working_directory_arg = None
+
+try:
+    from gateway.hasn_session import (
         get_hasn_allowed_tool_names as _get_hasn_allowed_tool_names,
         is_hasn_tool_allowed as _is_hasn_tool_allowed,
         stamp_allowed_tool_names_arg as _stamp_hasn_allowed_tool_names_arg,
@@ -4145,6 +4160,50 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                     "MCP server '%s': stamp _hasn_project_id failed (ignored)",
                     server_name,
                 )
+        # 本机项目目录只盖给本地 hasn MCP；stamp 函数会从 cloud 调用剥离同名键，
+        # 避免把设备绝对路径送入云端。打标器缺失或异常时仍剥离模型自填值，路径边界失败关闭。
+        if _stamp_hasn_working_directory_arg is not None:
+            try:
+                args = _stamp_hasn_working_directory_arg(server_name, args)
+            except Exception:
+                logger.debug(
+                    "MCP server '%s': stamp _hasn_working_directory failed; stripping reserved value",
+                    server_name,
+                )
+                if server_name in _HASN_STAMPED_MCP_SERVERS and isinstance(args, dict):
+                    args = {
+                        key: value
+                        for key, value in args.items()
+                        if key != _RESERVED_WORKING_DIRECTORY_ARG
+                    }
+        elif server_name in _HASN_STAMPED_MCP_SERVERS and isinstance(args, dict):
+            args = {
+                key: value
+                for key, value in args.items()
+                if key != _RESERVED_WORKING_DIRECTORY_ARG
+            }
+        # 项目上下文能力与本机路径同一隐私边界：只盖给本地 hasn，cloud 无条件剥离。
+        # 项目 run 的能力缺失由本地 MCP server fail-closed，不允许仅凭 project/path 参数扩权。
+        if _stamp_hasn_context_capability_arg is not None:
+            try:
+                args = _stamp_hasn_context_capability_arg(server_name, args)
+            except Exception:
+                logger.debug(
+                    "MCP server '%s': stamp _hasn_context_capability failed; stripping reserved value",
+                    server_name,
+                )
+                if server_name in _HASN_STAMPED_MCP_SERVERS and isinstance(args, dict):
+                    args = {
+                        key: value
+                        for key, value in args.items()
+                        if key != _RESERVED_CONTEXT_CAPABILITY_ARG
+                    }
+        elif server_name in _HASN_STAMPED_MCP_SERVERS and isinstance(args, dict):
+            args = {
+                key: value
+                for key, value in args.items()
+                if key != _RESERVED_CONTEXT_CAPABILITY_ARG
+            }
         # IMG3 P3.4：最后覆盖式注入工作会话精确工具白名单。受限会话若盖章
         # 异常必须失败关闭，否则下游会把缺字段误判为旧会话不限制。
         if _stamp_hasn_allowed_tool_names_arg is not None:

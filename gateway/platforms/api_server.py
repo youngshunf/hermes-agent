@@ -52,6 +52,7 @@ import os
 import re
 import sqlite3
 import sys
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -72,6 +73,59 @@ def _approval_event_choices(*, smart_denied: bool, allow_permanent: bool) -> lis
     if smart_denied:
         return ["once", "deny"]
     return ["once", "session", "always", "deny"] if allow_permanent else ["once", "session", "deny"]
+
+
+def _validate_project_runtime_context(
+    body: Dict[str, Any],
+) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """校验 daemon 定稿的项目 Runtime 上下文，并返回规范目录。
+
+    项目派发必须同时携带 ``project_id``、``node_id`` 与
+    ``working_directory``；非项目派发可显式携带工作目录。目录只接受当前仍然
+    存在、可写且已经规范化的绝对目录，任何失败都显式拒绝，不能回落到 profile cwd。
+    """
+
+    def _optional_nonempty_string(name: str) -> Optional[str]:
+        value = body.get(name)
+        if value is None:
+            return None
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"project runtime context field '{name}' is invalid")
+        return value.strip()
+
+    project_id = _optional_nonempty_string("project_id")
+    node_id = _optional_nonempty_string("node_id")
+    working_directory = _optional_nonempty_string("working_directory")
+
+    if project_id is not None and (node_id is None or working_directory is None):
+        raise ValueError(
+            "project runtime context requires project_id, node_id and working_directory"
+        )
+    if project_id is None and node_id is not None:
+        raise ValueError(
+            "project runtime context requires project_id when node_id is present"
+        )
+    if working_directory is None:
+        return project_id, node_id, None
+
+    raw_path = Path(working_directory)
+    if not raw_path.is_absolute():
+        raise ValueError("working_directory must be a canonical absolute directory")
+    try:
+        canonical = raw_path.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError("working_directory is unavailable") from exc
+    if canonical != raw_path or not canonical.is_dir():
+        raise ValueError("working_directory must be a canonical absolute directory")
+    try:
+        tempfile.NamedTemporaryFile(
+            dir=canonical,
+            prefix=".hasn-runtime-write-probe-",
+            delete=True,
+        ).close()
+    except OSError as exc:
+        raise ValueError("working_directory is not writable") from exc
+    return project_id, node_id, str(canonical)
 
 
 try:
@@ -4942,6 +4996,41 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=400,
                 )
 
+        try:
+            daemon_project_id, _daemon_node_id, working_directory = (
+                _validate_project_runtime_context(body)
+            )
+        except ValueError as exc:
+            return web.json_response(
+                _openai_error(
+                    str(exc),
+                    code="invalid_project_runtime_context",
+                ),
+                status=400,
+            )
+        project_context_capability = body.get("project_context_capability")
+        if daemon_project_id is not None:
+            if (
+                not isinstance(project_context_capability, str)
+                or not project_context_capability.strip()
+            ):
+                return web.json_response(
+                    _openai_error(
+                        "project_context_capability is required for project runs",
+                        code="invalid_project_runtime_context",
+                    ),
+                    status=400,
+                )
+            project_context_capability = project_context_capability.strip()
+        elif project_context_capability is not None:
+            return web.json_response(
+                _openai_error(
+                    "project_context_capability is only valid for project runs",
+                    code="invalid_project_runtime_context",
+                ),
+                status=400,
+            )
+
         dispatch_id = body.get("dispatch_id")
         dispatch_fingerprint = None
         if dispatch_id is not None:
@@ -5192,15 +5281,20 @@ class APIServerAdapter(BasePlatformAdapter):
                 def _run_sync():
                     from gateway.hasn_session import (
                         reset_hasn_allowed_tool_names,
+                        reset_hasn_context_capability,
                         reset_hasn_project_id,
                         reset_hasn_session_id,
+                        reset_hasn_working_directory,
                         reset_hasn_work_session_id,
                         set_hasn_allowed_tool_names,
+                        set_hasn_context_capability,
                         set_hasn_project_id,
                         set_hasn_session_id,
+                        set_hasn_working_directory,
                         set_hasn_work_session_id,
                     )
                     from gateway.session_context import clear_session_vars
+                    from tools import terminal_tool
                     from tools.approval import (
                         register_gateway_notify,
                         reset_current_session_key,
@@ -5208,9 +5302,13 @@ class APIServerAdapter(BasePlatformAdapter):
                         unregister_gateway_notify,
                     )
 
-                    effective_task_id = session_id or run_id
+                    # 终端环境与工具调用必须按 run 隔离。session_id 是可复用的对话历史轴，
+                    # 同一会话允许并发发起多个 run；若拿它作为 task_id，后启动的 run 会覆写
+                    # cwd，任一 run 收尾还会把另一 run 的覆盖项清掉。
+                    effective_task_id = run_id
                     approval_token = None
                     session_tokens = []
+                    task_env_registered = False
                     # 唤星会话绑定（提问卡修复）：把 daemon 透传的 session_id 绑到本 run 的
                     # 执行线程（任务局部，并发会话互不串扰），供本地 hasn MCP 工具系统侧注入
                     # ``_hasn_session_id``——哪个 session 发就回哪个 session，分身不自填。
@@ -5228,7 +5326,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     # register-on-write 据此把产出资源打到项目名下。非项目派发时 body 无
                     # ``project_id`` ⇒ None（不绑、不注入，零影响面）。
                     hasn_project_token = None
-                    daemon_project_id = body.get("project_id")
+                    hasn_working_directory_token = None
+                    hasn_context_capability_token = None
                     # IMG3 P3.4：把 daemon 透传的精确工具白名单绑定到本 run 线程，
                     # MCP handler 在模型输出后据此做最终目标判权并向下游可信盖章。
                     hasn_allowed_tools_token = None
@@ -5241,6 +5340,18 @@ class APIServerAdapter(BasePlatformAdapter):
                             session_tokens = self._bind_api_server_session(
                                 session_key=approval_session_key,
                             )
+                            if working_directory is not None:
+                                terminal_tool.register_task_env_overrides(
+                                    effective_task_id,
+                                    {
+                                        "cwd": working_directory,
+                                        "isolate_environment": True,
+                                        "restrict_file_tools_to_cwd": (
+                                            daemon_project_id is not None
+                                        ),
+                                    },
+                                )
+                                task_env_registered = True
                             if daemon_session_id:
                                 hasn_session_token = set_hasn_session_id(daemon_session_id)
                             if daemon_work_session_id:
@@ -5248,7 +5359,19 @@ class APIServerAdapter(BasePlatformAdapter):
                                     daemon_work_session_id
                                 )
                             if daemon_project_id:
-                                hasn_project_token = set_hasn_project_id(daemon_project_id)
+                                hasn_project_token = set_hasn_project_id(
+                                    daemon_project_id
+                                )
+                            if working_directory is not None:
+                                hasn_working_directory_token = (
+                                    set_hasn_working_directory(working_directory)
+                                )
+                            if project_context_capability is not None:
+                                hasn_context_capability_token = (
+                                    set_hasn_context_capability(
+                                        project_context_capability
+                                    )
+                                )
                             hasn_allowed_tools_token = set_hasn_allowed_tool_names(
                                 allowed_tool_names
                             )
@@ -5259,10 +5382,32 @@ class APIServerAdapter(BasePlatformAdapter):
                                 task_id=effective_task_id,
                             )
                         finally:
+                            if task_env_registered:
+                                terminal_tool.cleanup_vm(
+                                    effective_task_id,
+                                    force_remove=True,
+                                )
+                                terminal_tool.clear_task_env_overrides(
+                                    effective_task_id
+                                )
                             if hasn_allowed_tools_token is not None:
                                 try:
                                     reset_hasn_allowed_tool_names(
                                         hasn_allowed_tools_token
+                                    )
+                                except Exception:
+                                    pass
+                            if hasn_working_directory_token is not None:
+                                try:
+                                    reset_hasn_working_directory(
+                                        hasn_working_directory_token
+                                    )
+                                except Exception:
+                                    pass
+                            if hasn_context_capability_token is not None:
+                                try:
+                                    reset_hasn_context_capability(
+                                        hasn_context_capability_token
                                     )
                                 except Exception:
                                     pass
