@@ -158,6 +158,20 @@ except Exception:  # pragma: no cover - gateway 不可导入的进程（CLI/cron
     _is_hasn_tool_allowed = None
     _stamp_hasn_allowed_tool_names_arg = None
 
+# doc20-tools D-2：派发级能力域收紧（``{scope: "ask"|"deny"}``）。共享 sidecar 的常驻
+# MCP key 是会话无关的，per-dispatch 的收紧只能随每次工具调用盖章下达，daemon 侧才能
+# 据此执行 G5 硬门禁。gateway 不可导入时（CLI/cron）打标器为 None，此时仍剥离模型自填值。
+try:
+    from gateway.hasn_session import (
+        RESERVED_SCOPE_OVERRIDES_ARG as _RESERVED_SCOPE_OVERRIDES_ARG,
+        get_hasn_scope_overrides as _get_hasn_scope_overrides,
+        stamp_scope_overrides_arg as _stamp_hasn_scope_overrides_arg,
+    )
+except Exception:  # pragma: no cover - gateway 不可导入的进程（CLI/cron）
+    _RESERVED_SCOPE_OVERRIDES_ARG = "_hasn_scope_overrides"
+    _get_hasn_scope_overrides = None
+    _stamp_hasn_scope_overrides_arg = None
+
 # Upper bound for the OSV malware preflight during stdio MCP startup. The
 # check makes a blocking urllib HTTPS call whose own timeout can fail to
 # interrupt a stalled SSL handshake, which froze the asyncio event loop and
@@ -4203,6 +4217,45 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 key: value
                 for key, value in args.items()
                 if key != _RESERVED_CONTEXT_CAPABILITY_ARG
+            }
+        # doc20-tools D-2：覆盖式注入本次派发的能力域收紧（只盖本地 hasn，cloud 剥离）。
+        # 收紧会话若盖章异常必须**失败关闭**：静默放行等于本次派发的能力域门禁整条失效。
+        # 未下达收紧的 run（standalone 独立模式 / 主会话）走剥离分支，行为与改动前一致。
+        if _stamp_hasn_scope_overrides_arg is not None:
+            try:
+                args = _stamp_hasn_scope_overrides_arg(server_name, args)
+            except Exception:
+                logger.exception(
+                    "MCP server '%s': stamp _hasn_scope_overrides failed",
+                    server_name,
+                )
+                narrowed_session = True
+                if _get_hasn_scope_overrides is not None:
+                    try:
+                        narrowed_session = bool(_get_hasn_scope_overrides())
+                    except Exception:
+                        # 读不到当次收紧就按最严处理——收紧的失败方向必须更严，不是更松。
+                        narrowed_session = True
+                if narrowed_session:
+                    return json.dumps(
+                        {
+                            "code": "MCP_9206",
+                            "error": "ToolNotAllowed",
+                            "tool_name": tool_name,
+                        },
+                        ensure_ascii=False,
+                    )
+                if server_name in _HASN_STAMPED_MCP_SERVERS and isinstance(args, dict):
+                    args = {
+                        key: value
+                        for key, value in args.items()
+                        if key != _RESERVED_SCOPE_OVERRIDES_ARG
+                    }
+        elif server_name in _HASN_STAMPED_MCP_SERVERS and isinstance(args, dict):
+            args = {
+                key: value
+                for key, value in args.items()
+                if key != _RESERVED_SCOPE_OVERRIDES_ARG
             }
         # IMG3 P3.4：最后覆盖式注入工作会话精确工具白名单。受限会话若盖章
         # 异常必须失败关闭，否则下游会把缺字段误判为旧会话不限制。

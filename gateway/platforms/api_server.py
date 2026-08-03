@@ -4996,6 +4996,24 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=400,
                 )
 
+        # doc20-tools D-2：本次派发对能力域的**收紧覆盖**（``{scope: "ask"|"deny"}``）。
+        # 非法输入一律 400 拒绝派发、绝不静默忽略——收不住的收紧等于门禁失效。
+        # 缺键 ⇒ None（hasn-node 侧空表本就省略该键），行为与改动前逐字节一致。
+        scope_overrides = None
+        if "scope_overrides" in body:
+            from gateway.hasn_session import parse_scope_overrides
+
+            try:
+                scope_overrides = parse_scope_overrides(body["scope_overrides"])
+            except ValueError as exc:
+                return web.json_response(
+                    _openai_error(
+                        str(exc),
+                        code="invalid_scope_overrides",
+                    ),
+                    status=400,
+                )
+
         try:
             daemon_project_id, _daemon_node_id, working_directory = (
                 _validate_project_runtime_context(body)
@@ -5283,12 +5301,14 @@ class APIServerAdapter(BasePlatformAdapter):
                         reset_hasn_allowed_tool_names,
                         reset_hasn_context_capability,
                         reset_hasn_project_id,
+                        reset_hasn_scope_overrides,
                         reset_hasn_session_id,
                         reset_hasn_working_directory,
                         reset_hasn_work_session_id,
                         set_hasn_allowed_tool_names,
                         set_hasn_context_capability,
                         set_hasn_project_id,
+                        set_hasn_scope_overrides,
                         set_hasn_session_id,
                         set_hasn_working_directory,
                         set_hasn_work_session_id,
@@ -5331,6 +5351,10 @@ class APIServerAdapter(BasePlatformAdapter):
                     # IMG3 P3.4：把 daemon 透传的精确工具白名单绑定到本 run 线程，
                     # MCP handler 在模型输出后据此做最终目标判权并向下游可信盖章。
                     hasn_allowed_tools_token = None
+                    # doc20-tools D-2：把 daemon 透传的能力域收紧覆盖同轨绑到本 run 线程，
+                    # MCP handler 在模型输出后据此盖 ``_hasn_scope_overrides``——daemon 的
+                    # G5 门据它把本次派发能拿到的能力域再收一层（只收紧、绝不放宽）。
+                    hasn_scope_overrides_token = None
                     with self._profile_scope(request_profile):
                         try:
                             # Bind approval/session identity for this API run via
@@ -5375,6 +5399,9 @@ class APIServerAdapter(BasePlatformAdapter):
                             hasn_allowed_tools_token = set_hasn_allowed_tool_names(
                                 allowed_tool_names
                             )
+                            hasn_scope_overrides_token = set_hasn_scope_overrides(
+                                scope_overrides
+                            )
                             register_gateway_notify(approval_session_key, _approval_notify)
                             r = agent.run_conversation(
                                 user_message=user_message,
@@ -5390,6 +5417,13 @@ class APIServerAdapter(BasePlatformAdapter):
                                 terminal_tool.clear_task_env_overrides(
                                     effective_task_id
                                 )
+                            if hasn_scope_overrides_token is not None:
+                                try:
+                                    reset_hasn_scope_overrides(
+                                        hasn_scope_overrides_token
+                                    )
+                                except Exception:
+                                    pass
                             if hasn_allowed_tools_token is not None:
                                 try:
                                     reset_hasn_allowed_tool_names(

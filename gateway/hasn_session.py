@@ -72,6 +72,24 @@ RESERVED_CONTEXT_CAPABILITY_ARG = "_hasn_context_capability"
 # canonical 工具名；由 Runtime 在模型输出后覆盖式注入，分身不可自填。
 RESERVED_ALLOWED_TOOL_NAMES_ARG = "_hasn_allowed_tool_names"
 
+# 与 hasn-mcp（Rust）auth.rs::RESERVED_SCOPE_OVERRIDES_ARG 逐字一致（doc20-tools D-2）。
+# 本次派发对**能力域 scope** 的收紧覆盖，wire 形态是 ``{scope: "ask"|"deny"}`` 对象
+# （hasn-node session_scope.rs::ScopeOverrides::to_wire 的输出）。
+#
+# 为什么必须随每次工具调用盖章：内置 Hermes 是共享 sidecar，N 个并发会话复用同一条 MCP
+# 连接、同一把**会话无关**的常驻 MCP key，per-dispatch 的收紧既进不了 bearer 也进不了
+# 连接级 _meta，只能逐调用下达；由 Runtime 在模型输出**之后**覆盖式注入，分身伪造不了。
+#
+# ⚠️ 只盖给本地 ``hasn``：G5 收紧门在 hasn-mcp ``server.rs`` / ``dispatch_scope.rs``，
+# 云端**没有**该保留参数的消费方与剥离点（云端 trust_gate 只按 ``^_hasn_`` 前缀在
+# schema 上放行未知保留键，并不剥离），盖过去等于把一个多余入参原样送进云端工具处理器。
+RESERVED_SCOPE_OVERRIDES_ARG = "_hasn_scope_overrides"
+
+# 收紧覆盖的合法取值，与 hasn-node session_scope.rs::mode_wire_value 逐字一致。
+# **只收紧不放宽**：``allow`` 在语义上是「放宽」，而放宽在本模型里不存在——最终生效值
+# 恒为 ``min(Agent 三态, 派发覆盖)``，故它不是合法取值，收到即契约错误。
+HASN_SCOPE_OVERRIDE_MODES = frozenset({"ask", "deny"})
+
 # 本地 daemon MCP 服务在 Hermes 配置里的固定名字（见 huanxing_hermes_runtime
 # profile_config.py：``mcp_servers["hasn"]``）。
 HASN_LOCAL_MCP_SERVER = "hasn"
@@ -97,6 +115,10 @@ HASN_SESSION_TRANSPORT_TOOLS = frozenset(
 )
 
 _CANONICAL_TOOL_NAME = re.compile(r"^hasn(?:\.[A-Za-z0-9_-]+)+$")
+
+# 能力域键的畸形判据，与 hasn-node session_scope.rs::validate_values 同口径：
+# 空串、纯空白、含任意空白字符一律非法（拼错/带空格的键在 daemon 侧会静默失效）。
+_SCOPE_KEY_WHITESPACE = re.compile(r"\s")
 
 # 任务局部的当前 run 会话 id（daemon 透传的 ``session_id``）。并发会话互不串扰。
 _HASN_SESSION_ID: "ContextVar[Optional[str]]" = ContextVar(
@@ -131,6 +153,79 @@ _HASN_CONTEXT_CAPABILITY: "ContextVar[Optional[str]]" = ContextVar(
 _HASN_ALLOWED_TOOL_NAMES: "ContextVar[Optional[tuple[str, ...]]]" = ContextVar(
     "HUANXING_HASN_ALLOWED_TOOL_NAMES", default=None
 )
+
+# 任务局部的当前 run 能力域收紧覆盖（doc20-tools D-2）。与会话 id 同轨、并发派发互不串扰。
+# ``None`` = 本次派发未下达收紧（旧 daemon / standalone 独立模式）；与空 dict 语义相同，
+# 都不盖章——hasn-node 侧空表本就省略 ``scope_overrides`` 键，两者在 wire 上不可区分。
+_HASN_SCOPE_OVERRIDES: "ContextVar[Optional[dict[str, str]]]" = ContextVar(
+    "HUANXING_HASN_SCOPE_OVERRIDES", default=None
+)
+
+
+def parse_scope_overrides(raw: Any) -> dict[str, str]:
+    """严格解析派发级能力域收紧覆盖（doc20-tools D-2）。
+
+    线格式以 hasn-node 为准（``session_scope.rs::ScopeOverrides::to_wire``）：
+    ``{scope: "ask"|"deny"}``。三类输入一律抛 ``ValueError``、绝不静默忽略——
+    **静默忽略等于门禁失效**，拼错的键会让本次收紧无声失效（doc18 §10.2 B7 的原教训）：
+
+    1. 整体不是 JSON 对象；
+    2. 键畸形（非字符串、空、含空白）；
+    3. 值不在 ``ask`` / ``deny`` 内。其中 ``allow`` 单独给错误文案：它是「放宽」，
+       而放宽在本模型里不存在。
+
+    键是否属于**已知** scope 集合由 daemon 侧的 ``validate_against_known`` 负责
+    （Hermes 没有 scope 目录，不做半吊子猜测）。
+    """
+    if not isinstance(raw, dict):
+        raise ValueError("scope_overrides must be an object")
+    overrides: dict[str, str] = {}
+    for scope, mode in raw.items():
+        if (
+            not isinstance(scope, str)
+            or not scope.strip()
+            or _SCOPE_KEY_WHITESPACE.search(scope)
+        ):
+            raise ValueError(
+                f"scope_overrides contains a malformed scope key: {scope!r}"
+            )
+        if mode == "allow":
+            raise ValueError(
+                "scope_overrides can only narrow, never widen: "
+                f"scope '{scope}' asked for 'allow'"
+            )
+        if not isinstance(mode, str) or mode not in HASN_SCOPE_OVERRIDE_MODES:
+            raise ValueError(
+                f"scope_overrides['{scope}'] must be either 'ask' or 'deny'"
+            )
+        overrides[scope] = mode
+    return overrides
+
+
+def set_hasn_scope_overrides(
+    scope_overrides: Optional[Mapping[str, str]],
+) -> Token:
+    """绑定当前 run 的能力域收紧覆盖，返回供 ``finally`` 复原的 token。
+
+    存入独立快照（``dict(...)``），避免并发 run 共享同一个可变字典；空覆盖归一成
+    ``None``（与「未下达」同义，见 ``_HASN_SCOPE_OVERRIDES`` 的说明）。
+    """
+    normalized = dict(scope_overrides) if scope_overrides else None
+    return _HASN_SCOPE_OVERRIDES.set(normalized)
+
+
+def reset_hasn_scope_overrides(token: Token) -> None:
+    """复原当前 run 的能力域收紧覆盖绑定。"""
+    _HASN_SCOPE_OVERRIDES.reset(token)
+
+
+def get_hasn_scope_overrides() -> Optional[dict[str, str]]:
+    """读取当前 run 的能力域收紧覆盖（返回副本，调用方改不动绑定值）。
+
+    未绑定或空覆盖返回 ``None``——本次派发不额外收紧。
+    """
+    scope_overrides = _HASN_SCOPE_OVERRIDES.get()
+    return dict(scope_overrides) if scope_overrides else None
 
 
 def parse_allowed_tool_names(raw: Any) -> tuple[str, ...]:
@@ -406,6 +501,35 @@ def stamp_working_directory_arg(server_name: str, args: Any) -> Any:
             key: value
             for key, value in args.items()
             if key != RESERVED_WORKING_DIRECTORY_ARG
+        }
+    return args
+
+
+def stamp_scope_overrides_arg(server_name: str, args: Any) -> Any:
+    """只向本地 ``hasn`` MCP 调用盖入本次派发的能力域收紧覆盖（doc20-tools D-2）。
+
+    与 ``stamp_context_capability_arg`` 同规则、同不变量（纯函数、不修改入参）：
+
+    - 第三方 MCP → 原样返回（它们不剥离保留参数，注入即污染入参 schema）；
+    - 本地 ``hasn`` 且当前 run 有收紧 → 覆盖式写入 ``_hasn_scope_overrides``
+      （无条件盖在模型输出之后，分身伪造不了）；
+    - 其余唤星自有服务（``cloud``）与无收紧的本地调用 → strip 掉模型误填/伪造值。
+
+    **只盖本地**的理由见 ``RESERVED_SCOPE_OVERRIDES_ARG``：G5 收紧门在 hasn-mcp，
+    云端没有该保留参数的消费方与剥离点。
+    """
+    if server_name not in HASN_STAMPED_MCP_SERVERS:
+        return args
+    if not isinstance(args, Mapping):
+        return args
+    scope_overrides = get_hasn_scope_overrides()
+    if server_name == HASN_LOCAL_MCP_SERVER and scope_overrides:
+        return {**args, RESERVED_SCOPE_OVERRIDES_ARG: scope_overrides}
+    if RESERVED_SCOPE_OVERRIDES_ARG in args:
+        return {
+            key: value
+            for key, value in args.items()
+            if key != RESERVED_SCOPE_OVERRIDES_ARG
         }
     return args
 
