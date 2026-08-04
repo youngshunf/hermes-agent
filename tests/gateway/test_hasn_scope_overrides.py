@@ -104,12 +104,19 @@ def test_binding_returns_defensive_copy_and_collapses_empty():
         reset_hasn_scope_overrides(empty_token)
 
 
-# ── 盖章（只盖本地 hasn；cloud/伪造值一律剥离）──────────────────────────────
-def test_scope_overrides_are_authoritatively_stamped_for_local_hasn():
+# ── 盖章（本地 hasn + 云端 cloud 都盖；伪造值一律剥离）────────────────────────
+@pytest.mark.parametrize("server_name", ["hasn", "cloud"])
+def test_scope_overrides_are_authoritatively_stamped_for_hasn_servers(server_name):
+    """两个唤星自有服务都必须盖章。
+
+    云端 ``hasn.task.run_now``（声明 ``task:run``）本就是派发触发点，只盖本地等于工作会话
+    经 cloud MCP 仍能触发派发。云端消费方见
+    ``backend/app/mcp/trust_gate.py::pop_scope_overrides``。
+    """
     token = set_hasn_scope_overrides({"task:run": "deny", "media:generate": "ask"})
     try:
         original = {RESERVED_SCOPE_OVERRIDES_ARG: {"task:run": "allow"}, "value": 1}
-        stamped = stamp_scope_overrides_arg("hasn", original)
+        stamped = stamp_scope_overrides_arg(server_name, original)
 
         assert stamped[RESERVED_SCOPE_OVERRIDES_ARG] == {
             "task:run": "deny",
@@ -122,22 +129,14 @@ def test_scope_overrides_are_authoritatively_stamped_for_local_hasn():
         reset_hasn_scope_overrides(token)
 
 
-def test_cloud_and_missing_overrides_strip_forged_reserved_arg():
+def test_missing_overrides_strip_forged_reserved_arg():
     forged = {RESERVED_SCOPE_OVERRIDES_ARG: {"task:run": "allow"}, "value": 1}
 
-    # 云端没有该保留参数的消费方与剥离点 → 即便本次有收紧也只剥离、不盖章。
-    token = set_hasn_scope_overrides({"task:run": "deny"})
-    try:
-        cloud = stamp_scope_overrides_arg("cloud", forged)
-        assert RESERVED_SCOPE_OVERRIDES_ARG not in cloud
-        assert cloud["value"] == 1
-    finally:
-        reset_hasn_scope_overrides(token)
-
-    # 本次未下达收紧 → 剥离模型伪造值（分身自填注入无效）。
-    local = stamp_scope_overrides_arg("hasn", forged)
-    assert RESERVED_SCOPE_OVERRIDES_ARG not in local
-    assert local["value"] == 1
+    # 本次未下达收紧 → 两个唤星自有服务都剥离模型伪造值（分身自填注入无效）。
+    for server_name in ("hasn", "cloud"):
+        stripped = stamp_scope_overrides_arg(server_name, forged)
+        assert RESERVED_SCOPE_OVERRIDES_ARG not in stripped
+        assert stripped["value"] == 1
 
     # 第三方 MCP 原样返回（注入即污染入参 schema）。
     assert stamp_scope_overrides_arg("third-party", forged) is forged
@@ -177,6 +176,35 @@ def test_mcp_handler_stamps_scope_overrides_before_connecting(monkeypatch):
     assert captured["server_name"] == "hasn"
     assert captured["args"][RESERVED_SCOPE_OVERRIDES_ARG] == {"task:run": "deny"}
     # 测试进程里没有连上的 MCP server：这一步在盖章之后才发生，证明盖章不依赖网络。
+    assert "not connected" in result["error"]
+
+
+def test_mcp_handler_stamps_scope_overrides_for_cloud_dispatch_tool(monkeypatch):
+    """云端派发触发工具走的正是 ``cloud`` 服务——盖章必须覆盖它，否则云端那一半门禁不存在。
+
+    ``hasn.task.run_now`` 是云端 MCP 平台工具（``backend/app/mcp/tools/task.py``，声明
+    ``task:run``）；云端在 ``server.call_tool`` 里剥离本保留参数并在 G5 与 Agent 三态取更严者。
+    """
+    captured = {}
+    real_stamp = mcp_tool._stamp_hasn_scope_overrides_arg
+
+    def _spy(server_name, args):
+        stamped = real_stamp(server_name, args)
+        captured["args"] = stamped
+        return stamped
+
+    monkeypatch.setattr(mcp_tool, "_stamp_hasn_scope_overrides_arg", _spy)
+
+    token = set_hasn_scope_overrides({"task:run": "deny"})
+    try:
+        handler = mcp_tool._make_tool_handler("cloud", "hasn.task.run_now", 1.0)
+        result = json.loads(handler({"task_id": "t-1"}))
+    finally:
+        reset_hasn_scope_overrides(token)
+        mcp_tool._server_error_counts.pop("cloud", None)
+        mcp_tool._server_breaker_opened_at.pop("cloud", None)
+
+    assert captured["args"][RESERVED_SCOPE_OVERRIDES_ARG] == {"task:run": "deny"}
     assert "not connected" in result["error"]
 
 

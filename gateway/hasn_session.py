@@ -80,9 +80,14 @@ RESERVED_ALLOWED_TOOL_NAMES_ARG = "_hasn_allowed_tool_names"
 # 连接、同一把**会话无关**的常驻 MCP key，per-dispatch 的收紧既进不了 bearer 也进不了
 # 连接级 _meta，只能逐调用下达；由 Runtime 在模型输出**之后**覆盖式注入，分身伪造不了。
 #
-# ⚠️ 只盖给本地 ``hasn``：G5 收紧门在 hasn-mcp ``server.rs`` / ``dispatch_scope.rs``，
-# 云端**没有**该保留参数的消费方与剥离点（云端 trust_gate 只按 ``^_hasn_`` 前缀在
-# schema 上放行未知保留键，并不剥离），盖过去等于把一个多余入参原样送进云端工具处理器。
+# 本地 ``hasn`` 与云端 ``cloud`` **两个服务都盖**：G5 收紧门在两侧各有一套同源实现——
+# 本地是 hasn-mcp ``server.rs`` / ``dispatch_scope.rs``，云端是
+# ``backend/app/mcp/trust_gate.py::pop_scope_overrides`` → ``auth.py::AgentContext.tool_mode``。
+# 云端派发触发工具（``hasn.task.run_now``，声明 ``task:run``）本就在云端 MCP 面，只盖本地
+# 等于工作会话经 cloud MCP 仍能触发派发、防自激循环被整条绕过。
+# ⚠️ 顺序不可反：云端**必须先有剥离与消费**才能开这里的盖章——云端 trust_gate 的
+# ``^_hasn_`` 前缀只在 schema 上放行未知保留键、**并不剥离**，没有消费方时盖过去等于把一个
+# 多余入参原样送进云端工具处理器。
 RESERVED_SCOPE_OVERRIDES_ARG = "_hasn_scope_overrides"
 
 # 收紧覆盖的合法取值，与 hasn-node session_scope.rs::mode_wire_value 逐字一致。
@@ -506,24 +511,25 @@ def stamp_working_directory_arg(server_name: str, args: Any) -> Any:
 
 
 def stamp_scope_overrides_arg(server_name: str, args: Any) -> Any:
-    """只向本地 ``hasn`` MCP 调用盖入本次派发的能力域收紧覆盖（doc20-tools D-2）。
+    """向唤星自有 MCP 调用盖入本次派发的能力域收紧覆盖（doc20-tools D-2）。
 
-    与 ``stamp_context_capability_arg`` 同规则、同不变量（纯函数、不修改入参）：
+    与 ``stamp_session_arg`` 同规则、同不变量（纯函数、不修改入参、只对唤星自有服务打标）：
 
     - 第三方 MCP → 原样返回（它们不剥离保留参数，注入即污染入参 schema）；
-    - 本地 ``hasn`` 且当前 run 有收紧 → 覆盖式写入 ``_hasn_scope_overrides``
-      （无条件盖在模型输出之后，分身伪造不了）；
-    - 其余唤星自有服务（``cloud``）与无收紧的本地调用 → strip 掉模型误填/伪造值。
+    - 唤星自有服务（本地 ``hasn`` + 云端 ``cloud``）且当前 run 有收紧 → 覆盖式写入
+      ``_hasn_scope_overrides``（无条件盖在模型输出之后，分身伪造不了）；
+    - 当前 run 无收紧 → strip 掉模型误填/伪造值（分身自填注入无效）。
 
-    **只盖本地**的理由见 ``RESERVED_SCOPE_OVERRIDES_ARG``：G5 收紧门在 hasn-mcp，
-    云端没有该保留参数的消费方与剥离点。
+    **两个服务都盖**的理由见 ``RESERVED_SCOPE_OVERRIDES_ARG``：G5 收紧门在本地 hasn-mcp
+    与云端 ``app/mcp/trust_gate.py`` 各有一套同源实现，而云端 ``hasn.task.run_now``
+    （声明 ``task:run``）本就是派发触发点——只盖本地等于云端那一半门禁不存在。
     """
     if server_name not in HASN_STAMPED_MCP_SERVERS:
         return args
     if not isinstance(args, Mapping):
         return args
     scope_overrides = get_hasn_scope_overrides()
-    if server_name == HASN_LOCAL_MCP_SERVER and scope_overrides:
+    if scope_overrides:
         return {**args, RESERVED_SCOPE_OVERRIDES_ARG: scope_overrides}
     if RESERVED_SCOPE_OVERRIDES_ARG in args:
         return {
