@@ -36,6 +36,29 @@ daemon 侧经 `[runtime.hermes_supervisor] upstream_path`（开发）或打包�
 
 ## 日常工作流
 
+> ## ⚠️ 铁律：**本仓 HEAD 一动，就要去 hasn-node bump 钉版**
+>
+> hasn-node 的 daemon 把本仓 checkout 的 HEAD 与一个**编译进二进制的 40 位 SHA 常量**做
+> **逐字相等**比较，不等就拒绝启动任何 gateway。后果不是报个错就完了，是
+> **该机器上全部分身离线**、UI 只显示「Runtime 心跳过期，渠道暂不可操作」。
+>
+> | | |
+> |---|---|
+> | 钉版事实源 | `hasn-node/crates/hasn-runtime-adapter/src/adapters/hermes/embedded/config.rs` 的 `DEFAULT_HERMES_UPSTREAM_COMMIT` |
+> | 触发条件 | **任何**让 `huanxing` 分支 HEAD 移动的提交——合并上游、我们自己改代码、**以及纯文档提交** |
+> | 生效前提 | bump 之后必须**重编 daemon**（常量是编译期的）；桌面端要重新打包 |
+>
+> **实测踩过（2026-08-06）**：M5 收尾时往本仓推了一笔只改 `docs/` 的提交，dev 环境所有分身
+> 当场离线，而日志里只有一句「commit does not match the pinned SHA」，既没说期望值也没说
+> 实际值，从「分身怎么全离线」挖到这里花了很久。此后已补两道拦截：
+>
+> 1. `hasn-node/scripts/lib/hermes-upstream.sh::hasn_require_hermes_commit_pin`——
+>    `dev-desktop.sh` 等启动脚本在**起 daemon 之前**就比对 HEAD 与常量，不符直接 exit 1 并
+>    打印「改哪个文件的哪一行」；
+> 2. daemon 侧的错误信息现在带 `期望 / 实际 / 来源 / root`，不再是一句笼统的 invalid。
+>
+> 所以正常情况下你不会再被静默坑到——但**别指望拦截，push 完顺手 bump 才是正道**。
+
 ### 1. 在 huanxing 分支做修改
 
 ```bash
@@ -110,6 +133,32 @@ uv pip install --python venv/bin/python -e ".[messaging,cli,mcp]"
 
 **版本钉住**：生产发布 pin 到 huanxing 分支某个具体 sha（打包 worktree 检出该 sha），
 避免无意中把开发中代码带上线。
+
+### bump 钉版的完整动作（push 完立刻做，见本文顶部铁律）
+
+```bash
+# 1. 取本仓新的 HEAD
+NEW_SHA=$(git -C huanxing-apps/hermes-agent rev-parse HEAD)
+
+# 2. 改 hasn-node 的钉版常量（唯一事实源，M5 后包装层 config.py 已随仓归档）
+#    crates/hasn-runtime-adapter/src/adapters/hermes/embedded/config.rs
+#    pub const DEFAULT_HERMES_UPSTREAM_COMMIT: &str = "<NEW_SHA>";
+
+# 3. 重编 daemon（常量编译进二进制，不重编等于没改）
+cd hasn-node && cargo build -p hasn-daemon --bin hasn-node
+
+# 4. 自检：不符会 exit 1 并打印该改哪一行
+bash -c 'source scripts/lib/hermes-upstream.sh
+         hasn_require_hermes_upstream "$(hasn_resolve_hermes_upstream "$PWD")"'
+
+# 5. 生产/打包态：checkout 不带 .git，靠 marker 文件，别忘了同步
+git -C huanxing-apps/hermes-agent rev-parse HEAD \
+  > huanxing-apps/hermes-agent/.huanxing-hermes-agent-commit
+```
+
+**不跟进也是一种合法选择**：如果本次 fork 的新提交不该进产品（比如只是实验分支），
+就别 bump，改为把 daemon 用的 checkout 切回钉版 SHA。两者选一，**不允许「HEAD 走了、
+钉版不动、也不切回去」**——那正是全员离线的状态。
 
 ## 常见问题
 
