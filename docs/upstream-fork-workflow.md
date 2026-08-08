@@ -36,28 +36,30 @@ daemon 侧经 `[runtime.hermes_supervisor] upstream_path`（开发）或打包�
 
 ## 日常工作流
 
-> ## ⚠️ 铁律：**本仓 HEAD 一动，就要去 hasn-node bump 钉版**
+> ## ⚠️ 铁律：**本仓 HEAD 只由统一构建入口自动捕获，禁止手改钉版**
 >
-> hasn-node 的 daemon 把本仓 checkout 的 HEAD 与一个**编译进二进制的 40 位 SHA 常量**做
-> **逐字相等**比较，不等就拒绝启动任何 gateway。后果不是报个错就完了，是
+> hasn-node 的开发/打包入口从本仓真实 Git checkout 读取 HEAD，把同一个 40 位 SHA
+> 同时编进 daemon，并在正式制品中写入 `.huanxing-hermes-agent-commit`。daemon 运行时
+> 仍做**逐字相等**比较，不等就拒绝启动任何 gateway。后果不是报个错就完了，是
 > **该机器上全部分身离线**、UI 只显示「Runtime 心跳过期，渠道暂不可操作」。
 >
 > | | |
 > |---|---|
-> | 钉版事实源 | `hasn-node/crates/hasn-runtime-adapter/src/adapters/hermes/embedded/config.rs` 的 `DEFAULT_HERMES_UPSTREAM_COMMIT` |
-> | 触发条件 | **任何**让 `huanxing` 分支 HEAD 移动的提交——合并上游、我们自己改代码、**以及纯文档提交** |
-> | 生效前提 | bump 之后必须**重编 daemon**（常量是编译期的）；桌面端要重新打包 |
+> | 版本事实源 | 本次构建实际消费的 `git -C <hermes-agent> rev-parse HEAD` |
+> | daemon 期望值 | 构建期环境 `HASN_BUILD_HERMES_UPSTREAM_COMMIT`，由脚本自动注入 |
+> | 制品实际值 | 打包脚本写入的 `.huanxing-hermes-agent-commit`，与 daemon 期望值同源 |
 >
 > **实测踩过（2026-08-06）**：M5 收尾时往本仓推了一笔只改 `docs/` 的提交，dev 环境所有分身
-> 当场离线，而日志里只有一句「commit does not match the pinned SHA」，既没说期望值也没说
-> 实际值，从「分身怎么全离线」挖到这里花了很久。此后已补两道拦截：
+> 当场离线。旧流程要求再去 hasn-node 手工 bump 常量，且打包脚本剥离 `.git` 后漏写 marker，
+> v0.3.2 正式包因此把 11 个绑定全部留在 degraded。此后版本契约改为同源自动生成：
 >
-> 1. `hasn-node/scripts/lib/hermes-upstream.sh::hasn_require_hermes_commit_pin`——
->    `dev-desktop.sh` 等启动脚本在**起 daemon 之前**就比对 HEAD 与常量，不符直接 exit 1 并
->    打印「改哪个文件的哪一行」；
-> 2. daemon 侧的错误信息现在带 `期望 / 实际 / 来源 / root`，不再是一句笼统的 invalid。
+> 1. `hasn-node/scripts/lib/hermes-upstream.sh::hasn_resolve_hermes_upstream_commit` 只从真实 Git
+>    HEAD 取值，读不到或格式不合法就拒绝构建；
+> 2. 开发启动脚本自动把 HEAD 注入 Cargo；桌面打包脚本把同一个值注入 daemon 并写入制品 marker；
+> 3. daemon 侧继续 fail-closed，错误信息带 `期望 / 实际 / 来源 / root`。
 >
-> 所以正常情况下你不会再被静默坑到——但**别指望拦截，push 完顺手 bump 才是正道**。
+> **不要**在 Rust 源码或本仓 checkout 中手写 SHA/marker；绕过标准入口直接构建的 daemon
+> 会使用未注入哨兵并拒绝启动 Hermes gateway。
 
 ### 1. 在 huanxing 分支做修改
 
@@ -122,43 +124,34 @@ gh pr create --repo NousResearch/hermes-agent \
 cd huanxing-apps
 git clone -b huanxing git@github.com:youngshunf/hermes-agent.git hermes-agent
 cd hermes-agent
-git rev-parse HEAD > .huanxing-hermes-agent-commit
 uv venv venv --python 3.12
 uv pip install --python venv/bin/python -e ".[messaging,cli,mcp]"
 ```
 
 同一 40 位 SHA 由 daemon `UpstreamCheckout` 校验：开发态直接读 git HEAD；
-生产 rsync/tar 不带 `.git`，因此打包链路会把 `.huanxing-hermes-agent-commit`
-一起打进包。任一 SHA 不一致都会把 checkout 判为无效并拒绝启动 gateway。
+生产 rsync/tar 不带 `.git`，因此 hasn-node 打包链路会在**制品目录**写入
+`.huanxing-hermes-agent-commit`。源码 checkout 不保存这份派生标记。任一 SHA
+不一致都会把 checkout 判为无效并拒绝启动 gateway。
 
-**版本钉住**：生产发布 pin 到 huanxing 分支某个具体 sha（打包 worktree 检出该 sha），
-避免无意中把开发中代码带上线。
+**版本钉住**：生产发布在构建开始时捕获 huanxing checkout 的具体 SHA，并在构建结束前
+再次校验 HEAD 与工作树未变化，避免无意中把构建途中的混合代码带上线。
 
-### bump 钉版的完整动作（push 完立刻做，见本文顶部铁律）
+### 构建与自检（无需维护 SHA）
 
 ```bash
-# 1. 取本仓新的 HEAD
-NEW_SHA=$(git -C huanxing-apps/hermes-agent rev-parse HEAD)
+# 开发：入口会校验 checkout/venv、捕获 HEAD 并把它注入 Cargo
+cd hasn-node
+scripts/dev-desktop.sh
 
-# 2. 改 hasn-node 的钉版常量（唯一事实源，M5 后包装层 config.py 已随仓归档）
-#    crates/hasn-runtime-adapter/src/adapters/hermes/embedded/config.rs
-#    pub const DEFAULT_HERMES_UPSTREAM_COMMIT: &str = "<NEW_SHA>";
+# 正式发布：唯一入口自动完成 HEAD 冻结、daemon 注入和制品 marker 写入
+scripts/build-desktop-update.sh
 
-# 3. 重编 daemon（常量编译进二进制，不重编等于没改）
-cd hasn-node && cargo build -p hasn-daemon --bin hasn-node
-
-# 4. 自检：不符会 exit 1 并打印该改哪一行
-bash -c 'source scripts/lib/hermes-upstream.sh
-         hasn_require_hermes_upstream "$(hasn_resolve_hermes_upstream "$PWD")"'
-
-# 5. 生产/打包态：checkout 不带 .git，靠 marker 文件，别忘了同步
-git -C huanxing-apps/hermes-agent rev-parse HEAD \
-  > huanxing-apps/hermes-agent/.huanxing-hermes-agent-commit
+# 秒级契约测试：真实临时 Git 仓 + 注入/marker 顺序静态守卫
+bash tests/test_build_desktop_scripts.sh
 ```
 
-**不跟进也是一种合法选择**：如果本次 fork 的新提交不该进产品（比如只是实验分支），
-就别 bump，改为把 daemon 用的 checkout 切回钉版 SHA。两者选一，**不允许「HEAD 走了、
-钉版不动、也不切回去」**——那正是全员离线的状态。
+如果某个 fork 提交不该进产品，应在发布前把发布用 checkout 切到目标提交；构建入口会以
+当时的实际 HEAD 为唯一版本事实。禁止构建后再替换制品里的 Hermes 树或 marker。
 
 ## 常见问题
 
