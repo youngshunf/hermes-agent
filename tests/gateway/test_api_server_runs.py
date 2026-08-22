@@ -838,6 +838,64 @@ class TestRunStatus:
                 )
 
     @pytest.mark.asyncio
+    async def test_runs_input_prefix_appends_to_db_history_instead_of_replacing_it(
+        self, adapter
+    ):
+        """input 数组前缀 **叠加** 在 state.db transcript 之后，不是二选一。
+
+        回归锚点（2026-08-22 失忆事故）：前缀曾与回载共用 ``conversation_history``
+        一个变量，于是调用方只要在 ``input`` 里前置一条消息（技能加载指引一类），
+        ``if not conversation_history`` 就为假、整段 transcript 当轮不回载——分身
+        当场失忆一轮，而下一条不带前缀的消息又恢复正常，几乎无法归因。
+        """
+        app = _create_runs_app(adapter)
+        prior_history = [
+            {"role": "user", "content": "我叫小智"},
+            {"role": "assistant", "content": "你好小智"},
+        ]
+        mock_db = MagicMock()
+        mock_db.get_messages_as_conversation.return_value = list(prior_history)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create, patch.object(
+                adapter, "_ensure_session_db", return_value=mock_db
+            ):
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "记得"}
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={
+                        "input": [
+                            {"role": "user", "content": "本轮附带的前缀上下文"},
+                            {"role": "user", "content": "我叫什么"},
+                        ],
+                        "session_id": "sess_continuity",
+                    },
+                )
+                data = await resp.json()
+                run_id = data["run_id"]
+                for _ in range(20):
+                    status_resp = await cli.get(f"/v1/runs/{run_id}")
+                    status = await status_resp.json()
+                    if status["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+
+                mock_db.get_messages_as_conversation.assert_called_once_with(
+                    "sess_continuity"
+                )
+                kwargs = mock_agent.run_conversation.call_args.kwargs
+                # transcript 在前、本轮前缀在后，末条 user 消息仍是当轮诉求。
+                assert kwargs["conversation_history"] == prior_history + [
+                    {"role": "user", "content": "本轮附带的前缀上下文"}
+                ]
+                assert kwargs["user_message"] == "我叫什么"
+
+    @pytest.mark.asyncio
     async def test_status_not_found_returns_404(self, adapter):
         app = _create_runs_app(adapter)
         async with TestClient(TestServer(app)) as cli:

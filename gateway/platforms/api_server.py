@@ -5119,9 +5119,18 @@ class APIServerAdapter(BasePlatformAdapter):
                 if instructions is None:
                     instructions = stored.get("instructions")
 
-        # When input is a multi-message array, extract all but the last
-        # message as conversation history (the last becomes user_message).
-        # Only fires when no explicit history was provided.
+        # When input is a multi-message array, everything but the last message
+        # is *this turn's* prefix (the last becomes user_message).  It is kept
+        # SEPARATE from ``conversation_history`` on purpose: the prefix and the
+        # persisted transcript are two different things, and folding the prefix
+        # into ``conversation_history`` here made the session-resume branch
+        # below (`if not conversation_history`) silently skip the state.db
+        # reload — a caller that prepended even one message to ``input`` lost
+        # the entire stored transcript for that turn (agent answers with total
+        # amnesia, then remembers again on the very next message because that
+        # one carried no prefix).  Only fires when no explicit history was
+        # provided, matching the previous precedence.
+        input_prefix_history: List[Dict[str, str]] = []
         if not conversation_history and isinstance(raw_input, list) and len(raw_input) > 1:
             for msg in raw_input[:-1]:
                 if isinstance(msg, dict) and msg.get("role") and msg.get("content"):
@@ -5132,7 +5141,7 @@ class APIServerAdapter(BasePlatformAdapter):
                             part.get("text", "") for part in content
                             if isinstance(part, dict) and part.get("type") == "text"
                         )
-                    conversation_history.append({"role": msg["role"], "content": str(content)})
+                    input_prefix_history.append({"role": msg["role"], "content": str(content)})
 
         run_id = (
             f"run_d_{hashlib.sha256(dispatch_id.encode('utf-8')).hexdigest()[:32]}"
@@ -5173,6 +5182,12 @@ class APIServerAdapter(BasePlatformAdapter):
         # session 的历史，实现跨消息续接 —— 否则上游每条消息都冷启动新 session。
         # 与 _handle_chat_completions 同一机制；_handle_runs 已过 _check_auth，等同
         # 认证后续接，不存在未授权枚举 session 历史的风险。
+        # ⚠️ 判据是「调用方有没有显式接管历史」(`conversation_history` /
+        # `previous_response_id`)，**不是**「input 有没有前缀」。`input` 数组前缀是本轮
+        # 追加的上下文（技能加载指引一类），与已持久化的 transcript 是两回事，二者叠加
+        # 而不是二选一：曾经用 `if not conversation_history` 一个变量同时表示两者，
+        # 结果只要调用方在 `input` 里前置任意一条消息，整段 transcript 当轮不回载，
+        # 分身当场失忆一轮（下一条消息不带前缀又恢复正常，极难归因）。
         if not conversation_history and body.get("session_id"):
             try:
                 db = self._ensure_session_db()
@@ -5180,6 +5195,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     conversation_history = db.get_messages_as_conversation(session_id)
             except Exception as e:
                 logger.warning("runs: failed to load session history for %s: %s", session_id, e)
+        # 本轮前缀恒接在（可能刚回载的）transcript 之后，保持它相对当轮 user_message
+        # 的原有位置。显式接管历史时 `input_prefix_history` 必为空（提取条件同款判据），
+        # 因此这行对既有调用方逐字节等价。
+        if input_prefix_history:
+            conversation_history = list(conversation_history) + input_prefix_history
         # Approval queues gate host-side tool execution and must be isolated
         # per API run. Client-provided session IDs and memory session keys are
         # conversation/memory scopes, not authorization namespaces.
