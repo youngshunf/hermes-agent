@@ -407,6 +407,16 @@ _MAX_BACKOFF_SECONDS = 60
 # server is unrevivable: its tools are out of the registry, so no tool call
 # can ever reach the circuit-breaker half-open probe or _signal_reconnect.
 _PARKED_RETRY_INTERVAL = 300     # seconds between parked self-probes
+# 唤星补丁：`register_mcp_servers` 唤醒「已缓存但没有活会话」（parked / 重连中）的 server 后，
+# 等它就绪的上界。**唤醒而不等，等于没唤醒**——工具是在这一轮开头快照进 registry 的，
+# 醒了但没等，主人这一轮拿到的工具表照样没有那台 server 的工具（实测：云端 parked 时
+# 一轮开头 `MCP: registered 0 tool(s) from 0 server(s) (1 failed)`，分身随后拿本地通道
+# 猜了三个云端工具名全 9209，最后让主人去手动点重连）。
+#
+# 5 秒的取法：云端握手成功时实测 0.05–11s、中位数在 1s 以下，5 秒能接住绝大多数；真断网时
+# 每个 stale server 至多多等这 5 秒——代价有界，且只在**本来就没有工具可用**的那一轮发生。
+# 不设更大值是因为这段等待坐在主人这一轮的响应路径上。
+_STALE_REVIVAL_WAIT_SECONDS = 5.0
 _RECYCLED_RECONNECT_TIMEOUT = 15.0
 
 # Keepalive cadence for HTTP/SSE sessions. The MCP spec lets a server expire
@@ -5351,10 +5361,23 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     # Only attempt servers that aren't already connected and are enabled
     # (enabled: false skips the server entirely without removing its config)
     with _lock:
+        # 唤星补丁：去重判据必须**同时**排掉 `_server_connecting`，否则并发调用者各建一个
+        # supervisor。临界区只覆盖「算出 new_servers」，而 `_servers[k] = server` 发生在
+        # 锁外的 `_discover_and_register_server`（异步）——两个调用者（每轮对话的
+        # `discover_mcp_tools`、daemon 自愈触发的 `reconnect_mcp_servers`）在那个窗口里
+        # 都会算出「cloud 不在 _servers 里」，于是各起一条独立的重连退避循环，互相把对方
+        # 刚建好的会话拆掉。实测日志里同一秒内出现三条 `connection lost (attempt 2/5)`
+        # 却带着 16s / 2s / 60s 三个不同退避——单个 server 对象的 `_reconnect_retries`
+        # 不可能同时是三个值，那就是三条循环。
+        #
+        # `_server_connecting` 恰好覆盖「已有人在建、但还没写进 `_servers`」这段窗口，
+        # 下面本就在维护它，此前只用于 `get_mcp_status` 显示 "connecting"、没进判据。
         new_servers = {
             k: v
             for k, v in servers.items()
-            if k not in _servers and _parse_boolish(v.get("enabled", True), default=True)
+            if k not in _servers
+            and k not in _server_connecting
+            and _parse_boolish(v.get("enabled", True), default=True)
         }
         # Cached entries with no live session are parked or mid-reconnect.
         # Their tools are deregistered, so nothing else can reach
@@ -5376,8 +5399,20 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
             else:
                 _parallel_safe_servers.discard(sanitize_mcp_name_component(srv_name))
 
+    # 唤星补丁：先把全部 stale server 一起唤醒（`_signal_reconnect` 只 set event、不阻塞，
+    # 故它们**并行**重建），再统一等就绪。
+    #
+    # 此前这里只唤醒、不等，于是「醒了」和「这一轮能用」是两回事：工具在本轮开头快照进
+    # registry，重建落在快照之后，主人这一轮拿到的仍是没有那台 server 的工具表。分身对此
+    # 一无所知，只能拿本地通道去猜云端工具名（实测连猜三个全 9209），最后让主人自己去点
+    # 「重新连接」——而手动点之所以「一点就好」，正是因为那条路径走的是等待版重连。
+    #
+    # 等待成本只落在**本来就没有工具可用**的那一轮，上界见 `_STALE_REVIVAL_WAIT_SECONDS`；
+    # 等不到也只是退回原来的行为（本轮无该 server 工具），不阻断对话。
     for srv in stale_cached:
         _signal_reconnect(srv)
+    for srv in stale_cached:
+        _wait_for_server_session_ready(srv, timeout=_STALE_REVIVAL_WAIT_SECONDS)
 
     if not new_servers:
         return _existing_tool_names()
@@ -5429,6 +5464,15 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     finally:
         if _was_interrupted:
             _set_interrupt(True)
+        # 唤星补丁（与上面把 `_server_connecting` 加进去重判据是同一改动的两半，缺一不可）：
+        # 兜底摘掉本次认领的 connecting 标记。`_discover_all` 内部对每个结果都 discard 过，
+        # 但那段代码在 `_run_on_mcp_loop(..., timeout=120)` **超时或抛异常时根本走不到**——
+        # 标记就此永久残留。在加进判据之前这只是让状态卡多显示一会儿 "connecting"；
+        # 加进判据之后，残留意味着**那台 server 再也不会被重建**（每次 register 都跳过它），
+        # 比原来的并发 supervisor 更糟。`set.discard` 幂等，与内部那次清理不冲突。
+        with _lock:
+            for srv_name in new_servers:
+                _server_connecting.discard(srv_name)
 
     # Log a summary so ACP callers get visibility into what was registered.
     with _lock:
