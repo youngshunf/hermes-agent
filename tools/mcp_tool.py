@@ -4452,15 +4452,37 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
 
         try:
             result = _call_once()
-            # Check if the MCP tool itself returned an error
-            try:
-                parsed = json.loads(result)
-                if "error" in parsed:
-                    _bump_server_error(server_name)
-                else:
-                    _reset_server_error(server_name)  # success — reset
-            except (json.JSONDecodeError, TypeError):
-                _reset_server_error(server_name)  # non-JSON = success
+            # HuanXing：拿到 result 就意味着 server **应答了**这次 tools/call——传输层是活的，
+            # 与应答内容是成功还是 isError 无关。熔断器判的是**可达性**（它的对外话术就是
+            # "MCP server 'X' is unreachable"），业务错误绝不能计进去。
+            #
+            # 上游原样是「响应体里有 error 就 _bump_server_error」，实测会把一次入参写错放大成
+            # 整台 server 不可达：2026-08-26 生产，分身给云端元工具传错了一个键名，连吃 3 个
+            # `Input validation error`，第 4 发起就收到「MCP server 'cloud' is unreachable」，
+            # 于是它如实告诉主人「云端 MCP 不可用」——而云端一直是好的，同一分钟里别的调用还在成功。
+            # 本地通道同一天被同样打掉：3 个 `TOOL_NOT_FOUND`（纯业务错误）也够触发阈值。
+            # 熔断一开就是**整台 server 60 秒**，与那个工具、那个参数都无关的调用一起被拦。
+            #
+            # 这里能安全地无条件 reset，是因为 `_call()` 只在 `result.isError` 时产出 error 信封
+            # ——那必然是 server 亲自答的；传输真出问题时 `call_tool` 抛异常，走下面的
+            # `except Exception` 分支照旧 bump。「服务器在不在」与「这次调用对不对」由此分开。
+            #
+            # 反复失败的循环保护不靠熔断：agent 侧的 same_tool_failure_warning /
+            # repeated_exact_failure_warning 本来就在数同一工具的连续失败，而且它的话术是准确的
+            # （"inspect the error and change strategy"），不会像熔断那样谎报服务器挂了。
+            if logger.isEnabledFor(logging.DEBUG):
+                try:
+                    parsed = json.loads(result)
+                except (json.JSONDecodeError, TypeError):
+                    parsed = None
+                if isinstance(parsed, dict) and "error" in parsed:
+                    # 只记工具名，不记入参与错误值（入参可能含整页 HTML / 凭据）。
+                    logger.debug(
+                        "MCP %s/%s returned a tool error; server stays reachable "
+                        "(not a circuit-breaker strike)",
+                        server_name, tool_name,
+                    )
+            _reset_server_error(server_name)
             return result
         except InterruptedError:
             return _interrupted_call_result()

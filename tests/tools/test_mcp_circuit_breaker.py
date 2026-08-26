@@ -170,6 +170,105 @@ def test_circuit_breaker_half_opens_after_cooldown(monkeypatch, tmp_path):
         _cleanup(mcp_tool, "srv")
 
 
+def test_tool_error_response_does_not_trip_the_breaker(monkeypatch, tmp_path):
+    """HuanXing: a server that *answers* with a tool error is reachable — the
+    breaker must not count it.
+
+    2026-08-26 production: an agent sent one wrong key name to the cloud
+    meta-tool, took three ``Input validation error`` replies in a row, and from
+    the fourth call on got "MCP server 'cloud' is unreachable" — so it told its
+    owner the cloud tool channel was down. It wasn't: other calls on that very
+    same server were succeeding in the same minute. The breaker's whole claim is
+    *reachability*, and a returned error response is proof of reachability, not
+    evidence against it. The local channel was knocked out the same day by three
+    ``TOOL_NOT_FOUND`` business errors.
+
+    Mutation check: restore ``if "error" in parsed: _bump_server_error(...)`` in
+    the success path of ``_make_tool_handler`` and this goes red on the first
+    assertion after the threshold-th call.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from tools import mcp_tool
+    from tools.mcp_tool import _make_tool_handler
+
+    call_count = {"n": 0}
+
+    async def _call_tool_business_error(*a, **kw):
+        call_count["n"] += 1
+        result = MagicMock()
+        result.isError = True
+        block = MagicMock()
+        block.text = "Input validation error: 'tool' is a required property"
+        block.resource = None
+        result.content = [block]
+        result.structuredContent = None
+        return result
+
+    _install_stub_server(mcp_tool, "srv", _call_tool_business_error)
+    mcp_tool._ensure_mcp_loop()
+
+    try:
+        handler = _make_tool_handler("srv", "tool1", 10.0)
+        rounds = mcp_tool._CIRCUIT_BREAKER_THRESHOLD + 3
+
+        for i in range(rounds):
+            parsed = json.loads(handler({}))
+            # The server's own error must reach the model verbatim...
+            assert "required property" in parsed.get("error", ""), parsed
+            # ...and must never be rewritten into an "unreachable" claim.
+            assert "unreachable" not in parsed.get("error", "").lower(), (
+                f"call {i + 1}: a tool error was reported as an unreachable server"
+            )
+            # Every call must actually reach the session — no short-circuiting.
+            assert call_count["n"] == i + 1, (
+                f"call {i + 1}: breaker short-circuited a reachable server"
+            )
+            assert mcp_tool._server_error_counts.get("srv", 0) == 0, (
+                f"call {i + 1}: business error counted as a transport failure"
+            )
+    finally:
+        _cleanup(mcp_tool, "srv")
+
+
+def test_transport_failure_still_trips_the_breaker(monkeypatch, tmp_path):
+    """Reverse guard: not counting *tool* errors must not disarm the breaker.
+
+    A raised exception means the call never got an answer — that is the failure
+    mode the breaker exists for, and it must still trip on schedule.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from tools import mcp_tool
+    from tools.mcp_tool import _make_tool_handler
+
+    call_count = {"n": 0}
+
+    async def _call_tool_transport_dead(*a, **kw):
+        call_count["n"] += 1
+        raise RuntimeError("transport is gone")
+
+    _install_stub_server(mcp_tool, "srv", _call_tool_transport_dead)
+    mcp_tool._ensure_mcp_loop()
+
+    try:
+        handler = _make_tool_handler("srv", "tool1", 10.0)
+        threshold = mcp_tool._CIRCUIT_BREAKER_THRESHOLD
+
+        for _ in range(threshold):
+            json.loads(handler({}))
+        assert call_count["n"] == threshold
+        assert mcp_tool._server_error_counts.get("srv", 0) >= threshold
+
+        # Threshold reached → the next call short-circuits without touching
+        # the session.
+        parsed = json.loads(handler({}))
+        assert "unreachable" in parsed.get("error", "").lower(), parsed
+        assert call_count["n"] == threshold, "breaker should short-circuit now"
+    finally:
+        _cleanup(mcp_tool, "srv")
+
+
 def test_circuit_breaker_reopens_on_probe_failure(monkeypatch, tmp_path):
     """If the half-open probe fails, the breaker must re-arm the
     cooldown (not let every subsequent call through).
